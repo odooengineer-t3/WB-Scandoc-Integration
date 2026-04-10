@@ -1,0 +1,46 @@
+<odoo>
+    <record id="view_res_config_settings_form_inherit_api" model="ir.ui.view">
+        <field name="name">res.config.settings.form.inherit.api</field>
+        <field name="model">res.config.settings</field>
+        <field name="inherit_id" ref="base_setup.res_config_settings_view_form"/>
+        <field name="arch" type="xml">
+
+                <app name="general_settings" position="after">
+                    <app data-string="ScanDoc Integration" string="ScanDoc Integration" name="scandoc_integration"
+                         logo="/wb_scandoc_integration/static/description/icon.png">
+                        <block title="Usages" name="scandoc_allowed_usages_div">
+                            <setting string="Resume Scan" id="scandoc_resume_parser_setting">
+                                <field name="resume_scanner" force_save="1"/>
+                            </setting>
+                            <setting id="scandoc_resume_parser_setting" string="Delivery Challan Scan">
+                                <field name="vendorbill_receipt_scanner"/>
+                            </setting>
+                            <setting id="scandoc_resume_parser_setting" string="Vendor Bill Scan">
+                                <field name="vendorbill_scanner"/>
+                            </setting>
+                            <setting invisible="1" id="scans_limit" help="Select the cloud storage provider to store new attachments.">
+                                <field name="scans_limit"/>
+                            </setting>
+                             <setting invisible="1" id="used_credit" help="Select the cloud storage provider to store new attachments.">
+                                <field name="used_credit"/>
+                            </setting>
+                             <setting invisible="1" id="remaining_credit" help="Select the cloud storage provider to store new attachments.">
+                                <field name="remaining_credit" />
+                                <field name="transaction_ids" invisible="1"/>
+                            </setting>
+                        </block>
+                    </app>
+                </app>
+        </field>
+    </record>
+
+
+    <record id="action_scandoc_configuration" model="ir.actions.act_window">
+        <field name="name">Settings</field>
+        <field name="res_model">res.config.settings</field>
+        <field name="view_mode">form</field>
+        <field name="target">current</field>
+        <field name="context">{'module' : 'scandoc_integration', 'bin_size': False}</field>
+    </record>
+
+</odoo>

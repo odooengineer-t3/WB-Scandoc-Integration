@@ -1,0 +1,88 @@
+/* === Dashboard Scroll Container === */
+.o-dashboard-scroll {
+    max-height: calc(100vh - 140px); /* Adjust for Odoo topbar */
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-width: thin;
+    -webkit-overflow-scrolling: touch;
+}
+
+.o-dashboard-scroll::-webkit-scrollbar {
+    width: 8px;
+}
+
+.o-dashboard-scroll::-webkit-scrollbar-thumb {
+    background-color: #ccc;
+    border-radius: 4px;
+}
+
+.o-dashboard-scroll::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+/* === Equal Height Cards (Critical Fix) === */
+.resume-analysis-cards {
+    --card-min-height: 480px; /* Optional: set minimum card height */
+}
+
+.resume-analysis-cards .row {
+    display: flex;
+    flex-wrap: wrap;
+}
+
+.resume-analysis-cards [class*="col-"] {
+    display: flex;
+    flex-direction: column;
+}
+
+.resume-analysis-cards .card {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: var(--card-min-height, 0);
+    min-height: 0; /* Override Bootstrap's default */
+}
+
+.resume-analysis-cards .card-body {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Optional: Force content to grow */
+.resume-analysis-cards .flex-grow-1 {
+    flex-grow: 1;
+}
+
+/* === Circular Chart === */
+.circular-chart {
+    transform: rotate(-90deg);
+}
+
+.circular-chart .bg-circle {
+    stroke: #e9ecef;
+    fill: none;
+}
+
+.circular-chart .progress-circle {
+    stroke: #28a745;
+    fill: none;
+    transition: stroke-dashoffset 0.6s ease;
+    stroke-linecap: round;
+}
+
+/* === Password Toggle === */
+.toggle-password {
+    position: absolute;
+    top: 50%;
+    right: 15px;
+    transform: translateY(-50%);
+    cursor: pointer;
+    color: #aaa;
+    font-size: 1.1rem;
+    z-index: 10;
+}
+
+.toggle-password:hover {
+    color: #7e3af2;
+}

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<odoo>
+    <data>
+        <!-- Server Action for Authentication Check -->
+        <record id="action_scandoc_auth_check" model="ir.actions.server">
+            <field name="name">ScanDoc Authentication Check</field>
+            <field name="model_id" ref="model_scandoc_manager"/>
+            <field name="state">code</field>
+            <field name="code">action = model.action_check_auth_and_scan()</field>
+        </record>
+    </data>
+</odoo>
