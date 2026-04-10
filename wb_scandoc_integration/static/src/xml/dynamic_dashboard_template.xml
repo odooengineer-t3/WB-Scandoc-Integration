@@ -1,0 +1,402 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<templates id="template" xml:space="preserve">
+    <t t-name="owl.OdooDynamicDashboard">
+        <div class="o_scandoc_dashboard d-flex flex-column align-items-center w-100"
+             style="background:#f9fafb; gap:30px; padding:20px;max-height: 100vh; overflow-y: auto;">
+
+
+              <!-- ===================== LOGIN SETUP ===================== -->
+             <t t-if="!state.isLoading and !state.isLoggedIn">
+            <div class="card shadow-lg rounded-3 p-4" style="max-width: 420px; width:100%; border:none;">
+                <h2 class="text-center fw-bold mb-2" style="color:#7e3af2;">Login</h2>
+                <p class="text-center text-muted mb-4">Enter your credentials to continue</p>
+
+                <label class="form-label fw-semibold">Username</label>
+                <input type="text" class="form-control mb-3" placeholder="Enter your username"
+                       t-model="state.username"/>
+
+                <div class="mb-3">
+                    <label for="password" class="form-label">Password</label>
+                    <div class="input-group">
+                        <input
+                            type="password"
+                            id="passwordInput"
+                            t-model="state.password"
+                            class="form-control"
+                            placeholder="Enter your password"
+                        />
+                        <span
+                            class="input-group-text"
+                            role="button"
+                            t-on-click="togglePasswordVisibility"
+                        >
+                            <i class="fa fa-eye-slash"></i>
+                        </span>
+                    </div>
+                </div>
+
+                <button type="button" t-on-click="signIn"
+                        class="btn w-100 mb-3 text-white fw-semibold d-flex align-items-center justify-content-center"
+                        style="background:linear-gradient(90deg,#3b82f6,#9333ea); border:none;
+                               border-radius:10px; padding:12px; font-size:16px;">
+                    <i class="fa fa-sign-in-alt me-2"></i> Sign In
+                </button>
+
+                <div class="text-center text-danger fw-semibold">
+                    <t t-esc="state.loginMessage"/>
+                </div>
+
+                <hr class="my-4"/>
+
+                <div class="text-center">
+                    <p class="mb-2 text-muted">Don’t have an account?</p>
+                    <a href="https://portal.scandoc.xyz/register" target="_blank"
+                       style="color:#3b82f6; text-decoration:none; font-weight:600; cursor:pointer;">
+                        Sign Up for ScanDoc
+                    </a>
+                </div>
+            </div>
+        </t>
+
+        <!-- ===================== AUTHORIZATION SETUP ===================== -->
+        <t t-if="!state.isLoading and state.isLoggedIn and !state.isVerified">
+            <div class="card shadow-lg rounded-3 p-4" style="max-width: 420px; width:100%; border:none;">
+                <h2 class="text-center fw-bold mb-2" style="color:#7e3af2;">Authorization Setup</h2>
+                <p class="text-center text-muted mb-4">
+                    Enter your authorization key to access the system
+                </p>
+
+                <label class="form-label fw-semibold">Authorization Key</label>
+                <input type="text" class="form-control mb-4"
+                       placeholder="Enter your API Key" t-model="state.authKey"/>
+
+                <button type="button" t-on-click="verifyKey"
+                        class="btn w-100 mb-3 text-white fw-semibold d-flex align-items-center justify-content-center"
+                        style="background:linear-gradient(90deg,#7e3af2,#ec4899); border:none;
+                     border-radius:10px; padding:12px; font-size:16px;">
+                    <i class="fa fa-shield-alt me-2"/> Verify Key
+                </button>
+
+                <div class="text-center text-danger fw-semibold">
+                    <t t-esc="state.message"/>
+                </div>
+
+                <div class="text-center">
+                    <span class="text-muted me-1">Don’t have authorization key?</span>
+                    <a href="https://portal.scandoc.xyz/login" target="_blank" class="fw-semibold"
+                       style="color:#7e3af2; text-decoration:none;">
+                        <i class="fa fa-external-link-alt me-1"></i> Get Key
+                    </a>
+                </div>
+            </div>
+        </t>
+
+        <!-- ===================== API CONFIGURATION ===================== -->
+        <t t-if="!state.isLoading and state.isLoggedIn and state.isVerified">
+             <div class="card shadow-lg rounded-3 p-4" style="max-width: 480px; width:100%; border:none;">
+                <h2 class="text-center fw-bold mb-2" style="color:#7e3af2;">API Configuration</h2>
+                <p class="text-center text-muted mb-4">Your scanning service is connected and ready</p>
+                <p class="text-center text-muted mb-4">Last connection check: Just now</p>
+
+                <label class="form-label fw-semibold">Authorization Key</label>
+                <input type="text" class="form-control mb-4"
+                        t-att-value="this.getMaskedKey(state.authKey)"
+                       readonly="true"/>
+
+                <label class="form-label fw-semibold">Last Synchronization Date</label>
+                <input type="text" class="form-control mb-4" placeholder="Enter your Last Synchronization Date"
+                   t-att-value="state.lastSync" readonly="true"/>
+
+               <div class="d-flex justify-content-end align-items-center gap-2">
+                    <span class="px-3 py-2 rounded fw-semibold"
+                          style="background-color:#198754; color:white; border-radius:6px; font-size:14px;">
+                        <i class="fa fa-check me-1"></i>
+                        Verified
+                    </span>
+                    <button class="btn btn-outline-secondary px-3" data-bs-toggle="modal"
+                            data-bs-target="#reconfigModal">
+                        <i class="fa fa-cog me-1"></i>
+                        Reconfiguration
+                    </button>
+                    <button class="btn text-white px-3"
+                            style="background-color:#dc3545;"
+                            t-on-click="discardKey">
+                        <i class="fa fa-times-circle me-1"></i>
+                        Discard
+                    </button>
+                </div>
+             </div>
+         </t>
+
+         <!-- Reconfiguration Modal -->
+         <t t-if="!state.isLoading and state.isLoggedIn and state.isVerified">
+         <div class="modal fade" id="reconfigModal" tabindex="-1" aria-labelledby="reconfigModalLabel"
+                aria-hidden="true">
+               <div class="modal-dialog modal-dialog-centered">
+                   <div class="modal-content rounded-3 shadow-lg">
+
+                    <!-- Header -->
+                       <div class="modal-header">
+                          <h5 class="modal-title fw-semibold" id="reconfigModalLabel">Warning :Confirm Reconfiguration</h5>
+                           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                       </div>
+
+                       <!-- Body -->
+                       <div class="modal-body text-center">
+                           Reconfiguring will disconnect the system and delete your existing token. You will need to enter a new token afterward. Do you want to continue?
+                       </div>
+
+                       <!-- Footer -->
+                       <div class="modal-footer d-flex justify-content-center">
+                           <button type="button" class="btn btn-primary px-4"
+                                t-on-click="reconfigureKey" data-bs-dismiss="modal">Yes</button>
+                           <button type="button" class="btn btn-secondary px-4" data-bs-dismiss="modal">No</button>                       </div>
+                   </div>
+               </div>
+         </div>
+        </t>
+
+        <t t-if="!state.isLoading and state.isLoggedIn and state.isVerified">
+        <!-- ===================== CREDIT DASHBOARD ===================== -->
+            <div class="container-fluid mt-4" style="width:100%; padding: 0 20px;">
+            <div class="row g-3 mb-4">
+
+                <!-- Total Credits Purchased -->
+                <div class="col-md-4">
+                    <div class="card shadow-sm border-0 rounded-3 h-100 p-3" style="background:#fff;">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <h6 class="fw-semibold mb-1">Total Credits Purchased</h6>
+                            <i class="fa fa-credit-card text-purple fs-5"></i>
+                        </div>
+                        <!-- <h3 class="fw-bold mb-0">500</h3> -->
+                           <t t-esc="state.credits.scans_limit"/>
+
+
+                        <!-- <h3 class="fw-bold mb-0" t-esc="company"/> -->
+                        <p class="text-muted small mb-0">All-time purchases</p>
+                    </div>
+                </div>
+
+                <!-- Used Credits -->
+                <div class="col-md-4">
+                    <div class="card shadow-sm border-0 rounded-3 h-100 p-3" style="background:#fff;">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <h6 class="fw-semibold mb-1">Used Credits</h6>
+                            <i class="fa fa-chart-line text-primary fs-5"></i>
+                        </div>
+                        <h3 class="fw-bold mb-0"><t t-esc="state.credits.used_credit"/></h3>
+                       
+                    </div>
+                </div>
+
+                <!-- Remaining Credits -->
+                <div class="col-md-4">
+                    <div class="card shadow-sm border-0 rounded-3 h-100 p-3" style="background:#eafdf4;">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <h6 class="fw-semibold mb-1">Remaining Credits</h6>
+                            <i class="fa fa-exclamation-triangle text-success fs-5"></i>
+                        </div>
+                        <h3 class="fw-bold mb-0"><t t-esc="state.credits.remaining_credit"/></h3>
+                        <p class="text-muted small mb-0">Available for scanning</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Credit Management Section -->
+           <div class="card shadow-sm border-0 rounded-3 p-4">
+                <h5 class="fw-semibold mb-2">⚡ Credit Management</h5>
+                <p class="text-muted small mb-4">Manage your scanning credits and purchase history</p>
+
+                <!-- Button Row -->
+                <div class="row text-center">
+                    <div class="col-md-6 mb-2">
+                        <a href="https://portal.scandoc.xyz/dashboard" target="_blank"
+                           class="btn text-white w-100"
+                           style="background-color:#7e3af2; text-decoration:none;">
+                            <i class="fa fa-cart-plus me-2"> </i>
+                            Buy More Credits
+                        </a>
+                    </div>
+                    <!-- <div class="col-md-6 mb-2">
+                        <a href="https://portal.scandoc.xyz/dashboard" class="btn btn-light border w-100">
+                            <i class="fa fa-clock me-2"></i>
+                            View Credit History
+                        </a>
+                    </div> -->
+
+                </div>
+
+                <p class="text-muted small mt-3 text-center">
+                    Need help? Contact our sales team for bulk credit packages and enterprise pricing.
+                </p>
+           </div>
+        </div>
+        </t>
+
+                        <!-- ===================== CREDIT HISTORY (Full Width) ===================== -->
+       <!-- ===================== BILLING HISTORY (100% SAFE & WORKING) ===================== -->
+<t t-if="!state.isLoading and state.isLoggedIn and state.isVerified">
+    <div class="container-fluid mt-4">
+        <div class="card border-0 shadow-sm" style="border-radius:12px; overflow:hidden;">
+            <div class="card-body p-4">
+                <h3 class="mb-4 text-primary">
+                    Billing History
+                </h3>
+                <p class="text-muted small mb-4">Your recent credit purchases</p>
+
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle">
+                        <thead class="table-light">
+                            <tr>
+                                <th>Invoice</th>
+                                <th>Status</th>
+                                <th>Purchase Date</th>
+                                <th>Quantity</th>
+                                <th>Total</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <t t-foreach="paginatedTransactions" t-as="txn" t-key="txn.id">
+                                <tr>
+                                    <td class="fw-medium"><t t-esc="txn.invoice_name"/></td>
+                                    <td>
+                                     <span class="badge rounded-pill text-white"
+                                          t-attf-style="background:#{txn.status.toLowerCase() === 'paid'
+                                                                    ? 'green'
+                                                                    : (txn.status.toLowerCase() === 'failed'
+                                                                        ? 'red'
+                                                                        : '#7B61FF')};
+                                                         padding:5px 12px;">
+                                        <t t-esc="txn.status"/>
+                                    </span>
+                                    </td>
+                                    <td><t t-esc="txn.purchase_date"/></td>
+                                    <td><t t-esc="txn.quantity"/></td>
+                                    <td class="fw-semibold"><t t-esc="txn.total"/></td>
+                                </tr>
+                            </t>
+
+                            <t t-if="!state.transactions.length">
+                                <tr>
+                                    <td colspan="5" class="text-center text-muted py-5">
+                                        No transactions found.
+                                    </td>
+                                </tr>
+                            </t>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- BULLETPROOF PAGINATION – NO <strong> TAGS = NO XML ERRORS -->
+                <t t-if="state.transactions.length > state.itemsPerPage">
+                    <div class="d-flex justify-content-between align-items-center mt-4">
+                        <button class="btn btn-outline-secondary btn-sm"
+                                t-on-click="prevPageTransactions"
+                                t-att-disabled="state.pageTransactions === 1">
+                            Previous
+                        </button>
+
+                        <span class="text-muted fw-medium">
+                            Page <t t-esc="state.pageTransactions"/> of <t t-esc="totalPagesTransactions"/>
+                            <small class="ms-2 text-muted">
+                                (total <t t-esc="state.transactions.length"/> records)
+                            </small>
+                        </span>
+
+                        <button class="btn btn-outline-secondary btn-sm"
+                                t-on-click="nextPageTransactions"
+                                t-att-disabled="state.pageTransactions === totalPagesTransactions">
+                            Next
+                        </button>
+                    </div>
+                </t>
+            </div>
+        </div>
+    </div>
+</t>
+
+          <!-- ===================== AUDIT HISTORY (Full Width) ===================== -->
+        <t t-if="!state.isLoading and state.isLoggedIn and state.isVerified">
+            <div class="container-fluid mt-4" style="width:100%; padding: 0 20px;">
+            <div class="o_credit_card"
+                 style="background: #fff; border-radius: 12px; box-shadow: 0 2px 6px rgba(0,0,0,0.1); padding: 20px;">
+
+                <!-- Header -->
+                <h3 style="font-size: 20px; font-weight: bold; margin-bottom: 8px;">
+                    <i class="fa fa-clock-o" style="margin-right:5px;"></i>
+                    Extraction History
+                </h3>
+
+
+                <!-- Table -->
+                <table class="table table-hover table-sm"
+                       style="width:100%; font-size:14px; border-collapse: separate; border-spacing: 0 8px;">
+                    <thead style="background: #f9f9f9; font-weight: bold;">
+                        <tr>
+                            <th style="padding:10px;">Document Name</th>
+                            <th style="padding:10px;">Status</th>
+                            <th style="padding:10px;">Auditlog Date</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                            <!-- <t t-foreach="state.history" t-as="adt" t-key="adt.id"> -->
+                            <t t-foreach="paginatedHistory" t-as="adt" t-key="adt.id">
+
+                            <tr style="background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+                                <td style="padding:10px;">
+                                    <t t-esc="adt.document_name"/>
+                                </td>
+                                <td style="padding:10px;">
+                                    <span class="badge rounded-pill text-white"
+                                      t-attf-style="background:#{adt.status.toLowerCase() === 'success'
+                                                                ? 'green'
+                                                                : (adt.status.toLowerCase() === 'failed'
+                                                                    ? 'red'
+                                                                    : '#7B61FF')};
+                                                     padding:5px 12px;">
+                                    <t t-esc="adt.status"/>
+                                    </span>
+                                </td>
+                                <td style="padding:10px;">
+                                    <t t-esc="adt.auditlog_date"/>
+                                </td>
+                            </tr>
+                        </t>
+                        <t t-if="!state.history.length">
+                            <tr>
+                                <td colspan="5" style="text-align:center; color:#888; padding:20px;">
+                                    No History found.
+                                </td>
+                            </tr>
+                        </t>
+                    </tbody>
+                </table>
+                <t t-if="state.history.length > state.itemsPerPage">
+                    <div class="d-flex justify-content-between align-items-center mt-3">
+                       <button class="btn btn-outline-secondary btn-sm"
+                                t-on-click="prevPageHistory"
+                                t-att-disabled="state.pageHistory === 1">
+                            ← Previous
+                        </button>
+
+                        <span class="text-muted">
+                            Page <t t-esc="state.pageHistory"/> of <t t-esc="totalPagesHistory"/>
+                        </span>
+
+                        <button class="btn btn-outline-secondary btn-sm"
+                                t-on-click="nextPageHistory"
+                                t-att-disabled="state.pageHistory === totalPagesHistory">
+                            Next →
+                        </button>
+                    </div>
+                </t>
+                <br></br>
+                <br></br>
+                <br></br>
+            </div>
+        </div>
+        </t>
+    </div>
+</t>
+</templates>

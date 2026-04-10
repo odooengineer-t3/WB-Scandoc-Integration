@@ -1,0 +1,127 @@
+<odoo>
+    <record id="hr_applicant_view_form_inherit_skill_wb" model="ir.ui.view">
+    <field name="name">hr.applicant.form.inherit</field>
+        <field name="model">hr.applicant</field>
+        <field name="inherit_id" ref="hr_recruitment_skills.hr_applicant_view_form"/>
+        <field name="arch" type="xml">
+        <xpath expr="//notebook" position="inside">
+            <page string="Sentiment Analysis" invisible="1">
+                <field name="resume_sentiment" widget="html" nolabel="1" readonly="1"/>
+            </page>
+             <page string="Sentiment Analysis Data" invisible="1">
+                <group>
+                    <group>
+                        <field name="analysis_status" readonly="1"/>
+                        <field name="sentiment_score" readonly="1"/>
+                        <field name="emotional_tone" readonly="1"/>
+                        <field name="confidence_score" readonly="1"/>
+                        <field name="communication_style" readonly="1"/>
+                        <field name="cultural_fit_score" readonly="1"/>
+                        <field name="areas_for_improvement" readonly="1"/>
+                        <field name="communication_strengths" readonly="1"/>
+                        <field name="areas_for_development" readonly="1"/>
+                        <field name="cultural_values" readonly="1"/>
+                        <field name="collaboration_indicators" readonly="1"/>
+                        <field name="red_flags_detected" readonly="1"/>
+                    </group>
+                    <group>
+                        <field name="cultural_alignment" readonly="1"/>
+                        <field name="motivation_score" readonly="1"/>
+                        <field name="drive_level" readonly="1"/>
+                        <field name="personality_traits" readonly="1"/>
+                        <field name="risk_assessment" readonly="1"/>
+                        <field name="red_flags_count" readonly="1"/>
+                        <field name="resume_relevance_score" readonly="1"/>
+                        <field name="hire_recommendation_score" readonly="1"/>
+                        <field name="confidence_indicators" readonly="1"/>
+                        <field name="resume_analysis_json" readonly="1"/>
+                        <field name="primary_motivators" readonly="1"/>
+                    </group>
+                </group>
+            </page>
+            <xpath expr="//field[@name='categ_ids']" position="after">
+                <field name="sentiment_data" invisible="1"/>
+            </xpath>
+        </xpath>
+        </field>
+    </record>
+
+     <record id="view_company_form_dashboard_count_field" model="ir.ui.view">
+        <field name="name">res.company.form.inherit.account</field>
+        <field name="model">res.company</field>
+        <field name="inherit_id" ref="base.view_company_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='country_id']" position="after">
+                <field name="scandoc_auth_key" invisible="1"/>
+                <field name="scans_limit" invisible="1"/>
+                <field name="used_credit" invisible="1"/>
+                <field name="remaining_credit" invisible="1"/>
+                <field name="transaction_ids" invisible="1"/>
+                <field name="audit_history_ids" invisible="1"/>
+            </xpath>
+        </field>
+    </record>
+    
+    <record id="view_hr_applicant_form_inherit" model="ir.ui.view">
+        <field name="name">hr.applicant.form.inherit</field>
+        <field name="model">hr.applicant</field>
+        <field name="inherit_id" ref="hr_recruitment.hr_applicant_view_form"/>
+        <field name="arch" type="xml">
+            <!-- Add Parse CV Button -->
+            <xpath expr="//header" position="inside">
+                <field name="allow_parser" invisible="True"/>
+                    <button name="action_open_resume_analysis"
+                            type="object"
+                            string="Resume Analysis"
+                            class="btn-primary"
+                            invisible="analysis_status == 'done'"
+                            groups="wb_scandoc_integration.group_resume_scanner"/>
+
+                    <button name="action_open_resume_analysis"
+                            type="object"
+                            string="View Analysis"
+                            class="btn-primary"
+                            invisible="analysis_status == 'pending'or analysis_status == 'error'"
+                            groups="wb_scandoc_integration.group_resume_scanner"/>
+                        </xpath>
+            <!-- Sentiment Analysis & Extra Pages  -->
+            <xpath expr="//notebook" position="inside">
+                <page string="Work Experience">
+                    <field name="work_experience_ids" nolabel="1" context="{'show_attribute': False}" on_change="1">
+                        <tree editable="bottom">
+                            <field name="company_name"/>
+                            <field name="role"/>
+                            <field name="start_date"/>
+                            <field name="end_date"/>
+                            <field name="duration"/>
+                        </tree>
+                    </field>
+                </page>
+
+                <page string="Education">
+                    <field name="education_ids" nolabel="1">
+                        <tree editable="bottom">
+                            <field name="degree"/>
+                            <field name="institution"/>
+                            <field name="degree_duration"/>
+                        </tree>
+                    </field>
+                </page>
+            </xpath>
+
+            <xpath expr="//field[@name='linkedin_profile']" position="after">
+                <field name="resume_relevance_score_r" widget="progressbar" readonly="1"/>
+                <field name="total_work_experience" readonly="1"/>
+            </xpath>
+        </field>
+    </record>
+
+    <menuitem
+        id="menu_resume_scan_wizard"
+        name="Resume Scan"
+        parent="hr_recruitment.menu_crm_case_categ0_act_job"
+        groups="wb_scandoc_integration.group_resume_scanner"
+        action="wb_scandoc_integration.action_resume_parser_wizard"
+        sequence="100"
+    />
+</odoo>
