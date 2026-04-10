@@ -1,0 +1,46 @@
+<odoo>
+    <record id="view_stock_picking_form_inherit" model="ir.ui.view">
+        <field name="name">stock.picking.form.inherit</field>
+        <field name="model">stock.picking</field>
+        <field name="inherit_id" ref="stock.view_picking_form"/>
+        <field name="arch" type="xml">
+            <!-- Add Parse CV Button -->
+            <xpath expr="//header" position="inside">
+                <button name="action_parse_vendor_bill_receipt"
+                        type="object"
+                        string="Vendor Bill Scanner"
+                        class="btn btn-primary"
+                        context="{'default_doc_type': 'VendorBill', 'readonly_doc_type': True}"
+                        invisible="state!='draft' or picking_type_id.code != 'incoming'"
+                        groups="wb_scandoc_integration.group_receipt_scanner"/>
+            </xpath>
+            <xpath expr="//field[@name='picking_type_id']" position="after">
+                <field name="challan_number" readonly="state == 'done'"/>
+                <field name="vendor_gst_number" readonly="state == 'done'"/>
+                <field name="vehicle_number" readonly="state == 'done'"/>
+            </xpath>
+            <xpath expr="//field[@name='origin']" position="after">
+                <field name="transport_doc_no" readonly="state == 'done'"/>
+                <field name="transport_name" readonly="state == 'done'"/>
+                <field name="dispatch_location" readonly="state == 'done'"/>
+            </xpath>
+        </field>
+    </record>
+
+    <record id="action_deliver_parser_wizard" model="ir.actions.act_window">
+        <field name="name">Deliver Challan Parser</field>
+        <field name="res_model">resume.parser.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="context">{'default_doc_type': 'DeliveryChalaan', 'readonly_doc_type': True}</field>
+        <field name="target">new</field>
+    </record>
+
+    <menuitem
+        id="menu_receipt_parser_wizard"
+        name="Delivery Challan Scan"
+        parent="stock.menu_stock_transfers"
+        groups="wb_scandoc_integration.group_receipt_scanner"
+        action="wb_scandoc_integration.action_deliver_parser_wizard"
+        sequence="100"
+    />
+</odoo>

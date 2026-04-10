@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <menuitem id="menu_scandoc_root" name="ScanDoc" web_icon="wb_scandoc_integration,static/description/icon.png" sequence="0"/>
+   
+    <record id="dashboard_view_action" model="ir.actions.client">
+        <field name="name">ScanDoc Dashboard</field>
+        <field name="type">ir.actions.client</field>
+        <field name="tag">OdooDynamicDashboard</field>
+        <field name="target">current</field>
+        <field name="context" eval="{'noodialog': True}" />
+    </record>
+    <menuitem name="Dashboards" id="menu_dashboard" sequence="-1"
+              web_icon="odoo_dynamic_dashboard,static/description/icon.png"/>
+    <menuitem name="Dashboard" action="dashboard_view_action"
+              id="dashboard_root_menu"
+
+              parent="menu_scandoc_root"
+              sequence="0"/>
+
+   <record id="action_sentiment_dashboard" model="ir.actions.client">
+            <field name="name">Sentiment Dashboard</field>
+            <field name="tag">wb_scandoc_dashboard.static_dashboard</field>
+            <field name="target">new</field>
+            <field name="context">{}</field>
+    </record>
+</odoo>

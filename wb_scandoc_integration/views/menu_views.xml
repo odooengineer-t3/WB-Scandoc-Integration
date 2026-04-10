@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<odoo>
+    <data>
+        <!-- Main Menu for Scan Document (Only visible to authenticated users) -->
+        <menuitem 
+            id="menu_scan_document_direct"
+            name="Quick Scan"
+            sequence="10"
+            web_icon="wb_scandoc_integration,static/description/icon2.png"
+            action="action_scandoc_wizard"
+            groups="wb_scandoc_integration.group_scandoc_authenticated"/>
+    </data>
+</odoo>

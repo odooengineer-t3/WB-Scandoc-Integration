@@ -1,0 +1,1037 @@
+# -*- coding: utf-8 -*-
+"""
+This module defines a wizard for uploading and parsing resumes
+ using the ScanDoc API.
+It extracts relevant details and populates corresponding Odoo
+ models such as
+res.partner, hr.candidate, and hr.applicant.
+It also provides sentiment and tone analysis.
+"""
+
+import re
+import io
+import base64
+import logging
+import openpyxl
+import requests
+import mimetypes
+import pytesseract
+
+
+from PyPDF2 import PdfReader
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
+
+from odoo import models, fields, _, api
+from odoo.exceptions import UserError, ValidationError
+
+_logger = logging.getLogger(__name__)
+
+
+class ResumeParserWizard(models.TransientModel):
+    """
+    Wizard model to handle the upload, parsing, and analysis of resumes using
+    an external document scanning API (ScanDoc).
+    """
+    _name = 'resume.parser.wizard'
+    _description = 'Resume Parser Wizard'
+
+    file = fields.Binary("File", required=True)
+    file_name = fields.Char("Filename", required=True)
+    file_scanned = fields.Boolean(string="File Scanned?")
+    doc_type = fields.Selection([
+        ('resume', 'Resume'),
+        ('DeliveryChalaan', 'Delivery Challan'),
+        ('VendorBill', 'Vendor Bill')
+    ], string="Document Type", default='resume', required=True)
+    doc_type_readonly = fields.Boolean(string="Readonly Doc Type",
+                                       compute="_compute_doc_type_readonly",
+                                       store=True)
+    # doc_type = fields.Selection(selection_add=[
+    #     ('Resume', 'Resume')
+    # ], string="Document Type")
+
+
+
+    @api.depends('doc_type')
+    def _compute_doc_type_readonly(self):
+        for record in self:
+            record.doc_type_readonly = self.env.context.get('readonly_doc_type', False)
+
+    def _get_file_extension(self, filename):
+        """
+        Extracts the file extension from a filename.
+
+        :param filename: The name of the file.
+        :return: File extension with a leading dot (e.g., '.pdf').
+        """
+        return '.' + filename.split('.')[-1].lower() if '.' in filename else ''
+
+    def generate_sentiment_visual(self, sentiment_score):
+        """
+        Generate an emoji and label representation for a given sentiment score.
+
+        :param sentiment_score: The sentiment score as an integer.
+        :return: A string with visual (emoji) feedback.
+        """
+
+        result = ""
+        if 70 <= sentiment_score <= 100:
+            result = "🟢 (Positive) - Great Fit!"
+        elif 60 <= sentiment_score <= 69:
+            result = "🟡 (Neutral) - Potential Fit"
+        elif 0 <= sentiment_score < 60:
+            result = "🔴 (Negative) - Weak Fit"
+        else:
+            result = "⚪ (Invalid Score)"
+        return result
+
+    def process_resume(self):
+        """
+        Main entry point to parse a resume.
+        It sends the uploaded file to ScanDoc,
+        interprets the response, and updates or creates partner,
+        candidate, and
+        applicant records. Also attaches the resume and
+        adds sentiment analysis.
+
+        :return: Action to open the related applicant form view.
+        """
+        self.ensure_one()
+        # Get ScanDoc API Auth Key
+        auth_key = self.env['ir.config_parameter'].sudo().get_param(
+            'wb_scandoc_integration.scandoc_auth_key')
+        if not auth_key:
+            raise UserError(_(
+                "Missing ScanDoc authentication key in system parameters."
+            ))
+
+        if not self.file or not self.file_name:
+            raise UserError("Please upload a valid file.")
+
+        # Prepare file and metadata
+        file_content = base64.b64decode(self.file)
+
+        try:
+            file_content = base64.b64decode(self.file)
+        except Exception as e:
+            raise UserError(_("E rror decoding uploaded file: %s") % str(e))
+
+        # Detect MIME type dynamically
+        mimetype, encoding = mimetypes.guess_type(self.file_name)
+        mimetype = mimetype or 'application/octet-stream'
+
+        # Optional: Validate allowed file types
+        allowed_mimetypes = [
+            'application/pdf', 'image/jpeg', 'image/png',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # .docx
+            'application/msword',  # .doc
+        ]
+        if mimetype not in allowed_mimetypes:
+            raise UserError(_(
+                "Unsupported file type: %s. Please upload PDF, DOCX, JPG or PNG files only."
+            ) % mimetype)
+
+        # Proceed with request
+        files = [
+            ('file', (self.file_name, file_content, mimetype))
+        ]
+
+        # Example logging
+        mimetype = (mimetypes.guess_type(self.file_name)[0]
+                    or 'application/octet-stream')
+        url = ("https://scandocapi--scandoc-api."
+               "us-central1.hosted.app/api/documents/scan")
+
+        try:
+            # Send file to ScanDoc
+            response = requests.post(url, data={'authKey': auth_key, 'doc_type': self.doc_type}, files=[
+                ('file', (self.file_name, file_content, mimetype))
+            ])
+            parsed_data = response.json()
+            if parsed_data.get('error'):
+                raise ValidationError(_(f"{parsed_data.get('error')}"))
+            if not parsed_data.get('user') or not parsed_data.get('user').get('remainingScans') or parsed_data.get(
+                    'user').get('remainingScans') < 0:
+                raise ValidationError(_("You exceed your Scandoc Credit Limit. Please purchase new credits."))
+
+            self.env["ir.config_parameter"].sudo().set_param(
+                "wb_scandoc_integration.scandoc_credit", parsed_data.get('scanLimit')
+            )
+        except requests.exceptions.RequestException as e:
+            raise UserError(f"ScanDoc API request failed: {e}")
+        self.file_scanned = True
+
+        # Initialize dictionaries for storing model values
+        candidate_vals, application_vals, partner_vals = {}, {}, {}
+
+        # Parse response fields and map them to models
+        for key, value in parsed_data.get('extractedData').items():
+            if key == 'Full Name':
+                partner_vals.update({'type': 'contact', 'name': value or ''})
+                candidate_vals['partner_name'] = \
+                    application_vals['partner_name'] = value or ''
+
+            elif key == 'Email':
+                partner_vals['email'] = \
+                    candidate_vals['email_from'] = \
+                    application_vals['email_from'] = value or ''
+
+            elif key == 'Phone':
+                partner_vals['phone'] = \
+                    candidate_vals['partner_phone'] = \
+                    application_vals['partner_phone'] = value or ''
+
+            elif key == 'LinkedIn Profile':
+                candidate_vals['linkedin_profile'] = \
+                    application_vals['linkedin_profile'] = value or ''
+
+            elif key == 'Skills':
+                candidate_vals['candidate_skill_ids'] = \
+                    self._process_skills(value)
+
+            elif key == 'Work Experience':
+                current_date = datetime.today()
+                current_end_date = current_date.strftime("%B %Y")
+
+                # def calculate_duration_in_months(start_str, end_str):
+                #     """Return duration in months (int)."""
+                #     print("\n start_str",start_str)
+                #     try:
+                #         try:
+                #             start_date = datetime.strptime(start_str, "%B %Y")  # March 2023
+                #         except ValueError:
+                #             start_date = datetime.strptime(start_str, "%b %Y")  # Mar 2023
+
+                #         if not end_str or end_str.lower() == 'present':
+                #             end_date = current_date
+                #         else:
+                #             try:
+                #                 end_date = datetime.strptime(end_str, "%B %Y")
+                #             except ValueError:
+                #                 end_date = datetime.strptime(end_str, "%b %Y")
+
+                #         delta = relativedelta(end_date, start_date)
+                #         return delta.years * 12 + delta.months
+                #     except Exception as e:
+                #         return 0
+
+                def calculate_duration_in_months(start_str, end_str):
+                    """Return duration in months (int)."""
+                    try:
+                        # ✅ Step 1: normalize brackets and spaces
+                        start_str = start_str.replace("(", " ").replace(")", " ").strip()
+                        end_str = end_str.replace("(", " ").replace(")", " ").strip() if end_str else ""
+
+                        # ✅ Step 2: supported formats
+                        date_formats = ["%B %Y", "%b %Y", "%m/%Y", "%Y"]
+
+                        def parse_date(date_str):
+                            if not date_str or date_str.lower() == "present":
+                                return datetime.today()
+                            for fmt in date_formats:
+                                try:
+                                    return datetime.strptime(date_str, fmt)
+                                except ValueError:
+                                    continue
+                            return None  # failed to parse
+
+                        start_date = parse_date(start_str)
+                        end_date = parse_date(end_str)
+
+                        if not start_date or not end_date:
+                            return 0
+
+                        delta = relativedelta(end_date, start_date)
+                        return delta.years * 12 + delta.months
+                    except Exception:
+                        return 0
+
+                total_months = 0
+                work_experience_lines = []
+
+                for exp in value:
+                    start_date = exp.get('Start Date') or ''
+                    end_date = exp.get('End Date') or ''
+                    manual_duration = exp.get('Duration') or ''
+                    months = 0
+                    duration_str = ""
+
+                    # ✅ Case 1: Start + End date → calculate normally
+                    if start_date and end_date:
+                        months = calculate_duration_in_months(start_date, end_date)
+
+                    # ✅ Case 2: Start only → assume current month/year as End date
+                    elif start_date and not end_date:
+                        months = calculate_duration_in_months(start_date, current_end_date)
+                        end_date = "Present"  # keep "Present" in display
+
+                    # ✅ Case 3: No start/end dates → fallback to manual resume duration
+                    elif not start_date and not end_date:
+                        duration_str = manual_duration
+                        year_match = re.search(r'(\d+)\s*year', manual_duration.lower())
+                        month_match = re.search(r'(\d+)\s*\+?\s*month', manual_duration.lower())
+
+                        if year_match:
+                            months += int(year_match.group(1)) * 12
+
+                        if month_match:
+                            months += int(month_match.group(1))
+
+                    # Build duration string if not manual
+                    if months and not duration_str:
+                        years, rem_months = divmod(months, 12)
+                        if years and rem_months:
+                            duration_str = f"{years} year {rem_months} month"
+                        elif years:
+                            duration_str = f"{years} year"
+                        else:
+                            duration_str = f"{rem_months} month"
+
+                    total_months += months
+                    work_experience_lines.append((0, 0, {
+                        'company_name': exp.get('Company') or 'Unknown Company',
+                        'role': exp.get('Role') or '',
+                        'start_date': start_date,
+                        'end_date': end_date,
+                        'duration': duration_str,
+                    }))
+
+                application_vals['work_experience_ids'] = work_experience_lines
+
+                # ✅ Total Work Experience
+                if total_months:
+                    years, months = divmod(total_months, 12)
+
+                    year_str = f"{years} year" if years == 1 else f"{years} years"
+                    month_str = f"{months} month" if months == 1 else f"{months} months"
+
+                    if years and months:
+                        total_display = f"{year_str} {month_str}"
+                    elif years:
+                        total_display = year_str
+                    else:
+                        total_display = month_str
+                else:
+                    total_display = ""
+
+                application_vals['total_work_experience'] = total_display
+
+
+            elif key == 'Total Work Experience':
+                # Ignore ScanDoc-provided value since we calculate ourselves
+                pass
+
+            elif key == 'Job Position':
+                job_id = False
+                if value:  # Resume explicitly defines Job Position
+                    job = self.env['hr.job'].sudo().search([('name', '=', value)], limit=1)
+                    if job:
+                        job_id = job.id
+                else:
+                    # No job position in resume → check role from Work Experience
+                    for exp in application_vals.get('work_experience_ids', []):
+                        role = exp[2].get('role') if exp and isinstance(exp, tuple) else ''
+                        if role:
+                            job = self.env['hr.job'].sudo().search([('name', '=', role)], limit=1)
+                            if job:
+                                job_id = job.id
+                                break  # take first matching role
+                application_vals['job_id'] = job_id or False
+
+            elif key == 'Education':
+                application_vals['education_ids'] = [
+                    (0, 0, {
+                        'degree': edu['Degree'] or '',
+                        'institution': edu['Institution'] or '',
+                        'degree_duration': edu['Duration'] or ''
+                    }) for edu in value
+                ]
+
+            elif key == 'Summary':
+                application_vals['applicant_notes'] = str(value or '')
+
+            elif key == 'Sentiment Analysis':
+                sentiment_score = int(value.get("Overall Sentiment Score", 0))
+                sentiment_html = self._build_sentiment_html(
+                    sentiment_score, value,
+                    parsed_data.get('extractedData', {}).get('Tone Detection', {})
+                )
+                application_vals['resume_sentiment'] = sentiment_html
+
+            elif key == 'Resume Relevance Score':
+                application_vals['resume_relevance_score'] = value
+
+        # Create or update res.partner
+        partner = self.env['res.partner'].sudo().search([
+            ('name', '=', partner_vals['name']),
+            '|', ('email', '=', partner_vals['email'] or ''),
+            ('phone', '=', partner_vals['phone'] or '')
+        ], limit=1)
+        partner = partner or self.env['res.partner'].sudo().create(
+            partner_vals
+        )
+        partner.write(partner_vals)
+
+        # Create or update hr.candidate
+        candidate = self.env['hr.candidate'].sudo().search([
+            ('partner_id', '=', partner.id)
+        ], order="id desc", limit=1)
+        if not candidate:
+            candidate = self.env['hr.candidate'].sudo().create(candidate_vals)
+        else:
+            with self.env.cr.savepoint():
+                candidate.candidate_skill_ids.unlink()
+            candidate.write(candidate_vals)
+
+        # Create or update hr.applicant
+        application_vals['candidate_id'] = candidate.id
+        application = self.env['hr.applicant'].sudo().browse(
+            self.env.context.get('active_id')
+        )
+        if application:
+            application.write(application_vals)
+        else:
+            application = self.env['hr.applicant'].sudo().create(
+                application_vals
+            )
+
+        # Attach the uploaded resume file
+        self.env['ir.attachment'].sudo().create({
+            'name': self.file_name,
+            'res_model': 'hr.applicant',
+            'res_id': application.id,
+            'type': 'binary',
+            'datas': self.file,
+            'mimetype': mimetype,
+        })
+
+        if not self.env.context.get('active_id'):
+            return {
+                'type': 'ir.actions.act_window',
+                'res_model': 'hr.applicant',
+                'res_id': application.id,
+                'view_mode': 'form',
+                'target': 'current',
+            }
+
+    def _process_skills(self, skills_dict):
+        """
+        Converts parsed skill data into one2many-compatible format.
+        Creates skill types and skills as needed.
+
+        :param skills_dict: Dictionary of skill categories and their skills.
+        :return: List of tuples for candidate_skill_ids.
+        """
+        skill_lines = []
+        for category, skills in skills_dict.items():
+            skill_type = self.env['hr.skill.type'].sudo().search(
+                [('name', '=', category)], limit=1
+            )
+            if not skill_type:
+                skill_type = self.env['hr.skill.type'].sudo().create(
+                    {'name': category}
+                )
+
+            for skill_name in skills:
+                skill = self.env['hr.skill'].sudo().search([
+                    ('name', '=', skill_name),
+                    ('skill_type_id', '=', skill_type.id)
+                ], limit=1)
+                if not skill:
+                    skill = self.env['hr.skill'].sudo().create({
+                        'name': skill_name,
+                        'skill_type_id': skill_type.id
+                    })
+                level = self.env['hr.skill.level'].sudo().search([
+                    ('skill_type_id', '=', skill_type.id)
+                ], limit=1)
+                skill_lines.append((0, 0, {
+                    'skill_id': skill.id,
+                    'skill_type_id': skill_type.id,
+                    'skill_level_id': level.id
+                }))
+        return skill_lines
+
+    def _build_sentiment_html(self, score, sentiment_data, tone_data):
+        """
+        Builds a styled HTML block for visualizing sentiment and tone data.
+
+        :param score: Overall sentiment score as integer.
+        :param sentiment_data: Dictionary of sentiment scores and justifications.
+        :param tone_data: Dictionary of tone interpretations and keyword counts.
+        :return: HTML string to be rendered in the applicant form.
+        """
+        visual = self.generate_sentiment_visual(score)
+        stability = sentiment_data.get("Work Stability Check", {})
+
+        html = f"""
+               <div style="max-width: 600px; margin: auto; background: rgba(0,0,0,0.05);
+                           padding: 24px; border-radius: 16px;
+                           box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
+                   <!-- Section Header -->
+                   <h2 style="margin-top: 0; font-size: 24px; color: #222;">Sentiment Analysis</h2>
+
+                   <!-- Sentiment Block -->
+                   <div style="border: 1px solid #eee; border-radius: 12px; padding: 16px;
+                               margin-bottom: 24px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.30);
+                               background-color: #f9f9f9;">
+                       <p style="margin: 0; font-size: 16px;">
+                           <span style="font-size: 20px;">🎯 
+                               <strong>Sentiment Analysis</strong>
+                           </span>
+                       </p>
+                       <p style="margin: 4px 0;"><strong>Overall Sentiment:</strong> {visual}</p>
+                       <p style="margin: 4px 0;"><strong>Polarity Score:</strong> {score}%</p>
+                       <p style="margin: 4px 0;"><strong>Subjectivity Score:</strong>
+                           {sentiment_data.get('Subjectivity Score')}
+                       </p>
+                       <p style="margin: 4px 0;"><strong>Justification:</strong>
+                           {sentiment_data.get('Justification')}
+                       </p>
+                   </div>
+
+                   <!-- Work Stability -->
+                   <div style="background: #fff1f0; border-left: 5px solid #ff4d4f;
+                               border-radius: 12px; padding: 16px; margin-bottom: 24px;
+                               box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+                               transition: box-shadow 0.3s ease;">
+                       <p style="margin: 0; font-size: 16px;">
+                           <span style="font-size: 18px;">🔴</span>
+                           <strong>Work Stability Check</strong>
+                       </p>
+                       <p style="margin: 6px 0;"><strong>Risk Level:</strong>
+                           {stability.get('Risk Level')}
+                       </p>
+                       <p style="margin: 6px 0;"><strong>Job Changes in Last 6 Months:</strong>
+                           {stability.get('Job Changes in Last 6 Months')}
+                       </p>
+                       <p style="margin: 6px 0;"><strong>Job Changes in Last 1 Year:</strong> 
+                           {stability.get('Job Changes in Last 1 Year')}
+                       </p>
+                       <p style="margin: 6px 0;"><strong>Average Tenure per Company:</strong>
+                           {stability.get('Average Tenure per Company')}
+                       </p>
+                       <p style="margin: 6px 0;"><strong>Assessment:</strong>
+                           {stability.get('Stability Assessment')}
+                       </p>
+                   </div>
+
+                   <div style="border: 1px solid #eee; border-radius: 12px; padding: 16px;
+                               box-shadow: 0 6px 20px rgba(0, 0, 0, 0.30); background-color: #f9f9f9;">
+                       <h3 style="margin-top: 0; font-size: 18px;">Tone Detection</h3>
+                       <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+                   </div>
+               </div>
+            """
+
+        def find_emoji(interpretation=''):
+            emoji_map = {
+                'Leadership': '\U0001F60A',  # 😊
+                'Managerial': '\U0001F468\u200D\U0001F4BC',  # 👨‍💼
+                'Individual Contributions': '\U0001F9CD',  # 🧍
+                'Confidence': '\U0001F512',  # 🔒
+                'Problem-Solving': '\U0001F9E9',  # 🧩
+                'Communication': '\U0001F4AC',  # 💬
+                'Technical': '\U0001F6E0\ufe0f',  # 🛠️
+            }
+            return emoji_map.get(interpretation, '')
+
+        for tone, details in tone_data.items():
+            emoji = find_emoji(tone)
+            html += f"""
+               <tr>
+                 <td>{emoji} <strong>{tone}: </strong></td>
+                 <td style="text-align: right;">{details.get('Keyword Count')}</td>
+               </tr>"""
+        html += f"""
+               </table>
+               </div>
+               </div>
+           """
+        return html
+
+    def process_purchase_receipt(self):
+        """
+        Main entry point to parse a resume.
+        It sends the uploaded file to ScanDoc,
+        interprets the response, and updates or creates partner,
+        candidate, and
+        applicant records. Also attaches the resume and
+        adds sentiment analysis.
+
+        :return: Action to open the related applicant form view.
+        """
+        self.ensure_one()
+        # scandoc_manager_ids = self.env['scandoc.manager'].sudo().search([])
+        # remaining_credit = sum(scandoc_manager_ids.mapped('remaining_credit'))
+        # if remaining_credit <= 0:
+        #     raise ValidationError(_("You exceed your Scandoc Credit Limit. Please purchase new credits."))
+
+        # Get ScanDoc API Auth Key
+        auth_key = self.env['ir.config_parameter'].sudo().get_param(
+            'wb_scandoc_integration.scandoc_auth_key')
+        if not auth_key:
+            raise UserError(_(
+                "Missing ScanDoc authentication key in system parameters."
+            ))
+
+        if not self.file or not self.file_name:
+            raise UserError("Please upload a valid file.")
+
+        # Prepare file and metadata
+        file_content = ''
+        try:
+            file_content = base64.b64decode(self.file)
+        except Exception as e:
+            raise UserError(_("Error decoding uploaded file: %s") % str(e))
+
+        # Detect MIME type dynamically
+        mimetype, encoding = mimetypes.guess_type(self.file_name)
+        mimetype = mimetype or 'application/octet-stream'
+
+        # Optional: Validate allowed file types
+        allowed_mimetypes = [
+            'application/pdf', 'image/jpeg', 'image/png',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # .docx
+            'application/msword',  # .doc
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',  # .xlsx
+            'application/vnd.ms-excel',  # .xls
+        ]
+        if mimetype not in allowed_mimetypes:
+            raise UserError(_(
+                "Unsupported file type: %s. Please upload PDF, DOCX, JPG or PNG files only."
+            ) % mimetype)
+
+        # Example logging
+        mimetype = (mimetypes.guess_type(self.file_name)[0]
+                    or 'application/octet-stream')
+        url = ("https://scandocapi--scandoc-api."
+               "us-central1.hosted.app/api/documents/scan")
+
+        try:
+            # Send file to ScanDoc
+            doc_type_map = {
+                "Delivery Challan": "DeliveryChalaan",
+                "Vendor Bill": "VendorBill",
+                "Resume": "Resume",
+            }
+            doc_type = doc_type_map.get(self.doc_type, self.doc_type)
+            if not doc_type:
+                raise UserError("Document type not specified or incorrect.")
+
+            response = requests.post(
+                url,
+                data={'authKey': auth_key, 'doc_type': doc_type},
+                files=[('file', (self.file_name, file_content, mimetype))]
+            )
+            parsed_data = response.json()
+            if parsed_data.get('error'):
+                raise ValidationError(_(f"{parsed_data.get('error')}"))
+            if not parsed_data.get('user') or not parsed_data.get('user').get('remainingScans') or parsed_data.get('user').get('remainingScans') < 0:
+                raise ValidationError(_("You exceed your Scandoc Credit Limit. Please purchase new credits."))
+            self.env["ir.config_parameter"].sudo().set_param(
+                "wb_scandoc_integration.scandoc_credit", parsed_data.get('user').get('remainingScans')
+            )
+        except requests.exceptions.RequestException as e:
+            raise UserError(f"ScanDoc API request failed: {e}")
+        self.file_scanned = True
+
+        # Initialize dictionaries for storing model values
+        api_data = parsed_data.get('extractedData')
+
+        gstin_number = None
+
+        # GSTIN regex (15 characters, standard format)
+        extracted_text = ""
+
+        # If PDF
+        if mimetype == "application/pdf":
+            try:
+                pdf_file = io.BytesIO(file_content)
+                reader = PdfReader(pdf_file)
+                for page in reader.pages:
+                    extracted_text += page.extract_text() or ""
+            except Exception as e:
+                _logger.warning("PDF GSTIN extraction failed: %s", e)
+
+        # If DOCX
+        elif mimetype in [
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel"
+        ]:
+            try:
+                wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True)
+                extracted_text = ""
+                for sheet in wb.worksheets:
+                    for row in sheet.iter_rows(values_only=True):
+                        row_text = " ".join([str(cell) for cell in row if cell])
+                        if row_text.strip():
+                            extracted_text += " " + row_text
+                            print("\n extracted_text",extracted_text)
+                _logger.info("Extracted Excel Text (first 300 chars): %s", extracted_text[:300])
+            except Exception as e:
+                _logger.warning("Excel GSTIN extraction failed: %s", e)
+
+        # If Image (PNG/JPG) – use OCR
+        elif mimetype in ["image/jpeg", "image/png"]:
+            try:
+                 # Open the image
+                image = Image.open(io.BytesIO(file_content))
+
+                # Convert to grayscale (helps simplify the text extraction)
+                image = image.convert('L')
+
+                # Resize the image to make text clearer (doubling the resolution)
+                image = image.resize((image.width * 2, image.height * 2))  # Experiment with this factor
+
+                # Thresholding: Convert the image into a binary format (black and white)
+                image = image.point(lambda p: p > 180 and 255)  # Adjust threshold value (180) as needed
+
+                # Invert the image colors (make text black and background white)
+                image = ImageOps.invert(image)
+
+                # Optional: Apply median filter (reduces noise) and sharpen the image
+                image = image.filter(ImageFilter.MedianFilter(3))  # Try different filter sizes (3, 5, etc.)
+                image = image.filter(ImageFilter.SHARPEN)
+
+                # Enhance contrast to make text stand out more clearly
+                enhancer = ImageEnhance.Contrast(image)
+                image = enhancer.enhance(2)  # Try different values for better contrast
+
+                # Use pytesseract to extract the text
+                custom_config = r'--oem 3 --psm 6'  # Use LSTM OCR model
+                extracted_text = pytesseract.image_to_string(image, config=custom_config)
+            except Exception as e:
+                _logger.warning("OCR GSTIN extraction failed: %s", e)
+                return ""
+            extracted_text = extracted_text.replace("\n", " ").replace("\r", " ").strip()
+        # Regular expression for GST number
+        gstin_pattern = r"\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]{3}\b"
+        # Find GSTIN matches in the extracted text
+        gstin_matches = re.findall(gstin_pattern, extracted_text)
+
+        # Clean extracted text (remove newlines, extra spaces, etc.)
+        extracted_text = extracted_text.replace("\n", " ").replace("\r", " ").strip()
+
+        # Regular expression for GST number
+        gstin_pattern = r"\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]{3}\b"
+
+        # Find GSTIN matches in the extracted text
+        gstin_matches = re.findall(gstin_pattern, extracted_text)
+        print("\ngstin_matches:", gstin_matches)
+
+        if gstin_matches:
+            gstin_number = gstin_matches[0]
+        else:
+            gstin_number = ''
+        picking_type = self.env['stock.picking.type'].search([
+            ('code', '=', 'incoming'),
+            ('warehouse_id.company_id', '=', self.env.company.id)
+        ], limit=1)
+        if not picking_type:
+            raise ValueError("No Incoming Picking Type found for this company.")
+
+        # 2️⃣ Get or create partner (Consignor = vendor)
+        partner = self.env['res.partner'].search([
+            ('name', '=', api_data.get('Consignor Name'))
+        ], limit=1)
+
+        if not partner:
+            partner = self.env['res.partner'].create({
+                'name': api_data.get('Consignor Name'),
+                'street': api_data.get('Consignor Address'),
+                'company_type': 'company',
+            })
+
+        # 3️⃣ Prepare stock.move lines
+        move_lines = []
+        for item in api_data.get('Items', []):
+            product = self.env['product.product'].search([
+                ('default_code', '=', item.get('HSN/SAC'))
+            ], limit=1)
+
+            if not product:
+                # Create placeholder product if not exists
+                product = self.env['product.product'].create({
+                    'name': item.get('Description'),
+                    'default_code': item.get('HSN/SAC'),
+                    'type': 'consu',
+                    'uom_id': self.env.ref('uom.product_uom_unit').id,
+                    'uom_po_id': self.env.ref('uom.product_uom_unit').id,
+                })
+
+            move_lines.append((0, 0, {
+                'name': item.get('Description'),
+                'product_id': product.id,
+                'product_uom_qty': float(item.get('Quantity', 0)),
+                'product_uom': product.uom_id.id,
+                'location_id': picking_type.default_location_src_id.id,
+                'location_dest_id': picking_type.default_location_dest_id.id,
+            }))
+        challan_date_str = api_data.get("Challan Date")
+        scheduled_date = False
+        if challan_date_str:
+            challan_date_str = challan_date_str.strip()
+            _logger.info("👉 Raw challan_date_str: %r", challan_date_str)
+            try:
+                if "/" in challan_date_str:
+                    try:
+                        scheduled_date = datetime.strptime(challan_date_str, "%d/%m/%Y")
+                    except ValueError:
+                        scheduled_date = datetime.strptime(challan_date_str, "%d/%m/%y")
+                elif "-" in challan_date_str:
+                    try:
+                        scheduled_date = datetime.strptime(challan_date_str, "%d-%m-%Y")
+                    except ValueError:
+                        scheduled_date = datetime.strptime(challan_date_str, "%d-%m-%y")
+            except ValueError:
+                raise UserError(_("Invalid date format in Challan Date: %s") % challan_date_str)
+
+        challan_number = api_data.get("Challan Number")
+
+        # ✅ Check if challan number already exists
+        if challan_number:
+            exists = self.env['stock.picking'].search([('challan_number', '=', challan_number)])
+            if exists:
+                raise ValidationError(_("A record with Challan Number %s already exists!") % challan_number)
+        # 4️⃣ Create the picking
+        picking_vals = {
+            'picking_type_id': picking_type.id,
+            'partner_id': partner.id,
+            'origin': api_data.get('Reference Number') or api_data.get('Challan Number'),
+            'scheduled_date': scheduled_date,
+            'move_ids_without_package': move_lines,
+            'challan_number':api_data.get('Challan Number'),
+            'vehicle_number':api_data.get("Transport Details", {}).get("Vehicle Number"),
+            'transport_name':api_data.get("Transport Details", {}).get("Transporter Name"),
+            'dispatch_location':api_data.get('Dispatch From'),
+            'transport_doc_no': api_data.get("Transport Details", {}).get("LR Number"),
+        }
+
+        picking = self.env['stock.picking'].create(picking_vals)
+        picking.write({'vendor_gst_number': False})
+        picking.write({'vendor_gst_number': gstin_number or ''})
+        # # Attach the uploaded resume file
+        self.env['ir.attachment'].sudo().create({
+            'name': self.file_name,
+            'res_model': 'stock.picking',
+            'res_id': picking.id,
+            'type': 'binary',
+            'datas': self.file,
+            'mimetype': mimetype,
+        })
+
+        return {
+            'type': 'ir.actions.act_window',
+            'res_model': 'stock.picking',
+            'res_id': picking.id,
+            'view_mode': 'form',
+            'target': 'current',
+        }
+
+    def process_purchase_order(self):
+        """
+        Main entry point to parse a resume.
+        It sends the uploaded file to ScanDoc,
+        interprets the response, and updates or creates partner,
+        candidate, and
+        applicant records. Also attaches the resume and
+        adds sentiment analysis.
+
+        :return: Action to open the related applicant form view.
+        """
+        self.ensure_one()
+        # scandoc_manager_ids = self.env['scandoc.manager'].sudo().search([])
+        # remaining_credit = sum(scandoc_manager_ids.mapped('remaining_credit'))
+        # if remaining_credit <= 0:
+        #     raise ValidationError(_("You exceed your Scandoc Credit Limit. Please purchase new credits."))
+
+        # Get ScanDoc API Auth Key
+        auth_key = self.env['ir.config_parameter'].sudo().get_param(
+            'wb_scandoc_integration.scandoc_auth_key')
+        if not auth_key:
+            raise UserError(_(
+                "Missing ScanDoc authentication key in system parameters."
+            ))
+
+        if not self.file or not self.file_name:
+            raise UserError("Please upload a valid file.")
+
+        # Prepare file and metadata
+        file_content = ''
+        try:
+            file_content = base64.b64decode(self.file)
+        except Exception as e:
+            raise UserError(_("Error decoding uploaded file: %s") % str(e))
+
+        # Detect MIME type dynamically
+        mimetype, encoding = mimetypes.guess_type(self.file_name)
+        mimetype = mimetype or 'application/octet-stream'
+
+        # Optional: Validate allowed file types
+        allowed_mimetypes = [
+            'application/pdf', 'image/jpeg', 'image/png',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # .docx
+            'application/msword',  # .doc
+        ]
+        if mimetype not in allowed_mimetypes:
+            raise UserError(_(
+                "Unsupported file type: %s. Please upload PDF, DOCX, JPG or PNG files only."
+            ) % mimetype)
+
+        # Example logging
+        mimetype = (mimetypes.guess_type(self.file_name)[0]
+                    or 'application/octet-stream')
+        url = ("https://scandocapi--scandoc-api."
+               "us-central1.hosted.app/api/documents/scan")
+
+        try:
+            # Send file to ScanDoc
+            response = requests.post(url, data={'authKey': auth_key, 'doc_type': self.doc_type}, files=[
+                ('file', (self.file_name, file_content, mimetype))
+            ])
+            parsed_data = response.json()
+            if parsed_data.get('error'):
+                raise ValidationError(_(f"{parsed_data.get('error')}"))
+            if not parsed_data.get('user') or not parsed_data.get('user').get('remainingScans') or parsed_data.get('user').get('remainingScans') < 0:
+                raise ValidationError(_("You exceed your Scandoc Credit Limit. Please purchase new credits."))
+            # for scan_manager in scandoc_manager_ids:
+            #     if scan_manager.remaining_credit > 0:
+            #         scan_manager.remaining_credit = parsed_data.get('scanLimit')
+            #         scan_manager.used_credit = scan_manager.purchased_credit - scan_manager.remaining_credit
+            #         break
+            self.env["ir.config_parameter"].sudo().set_param(
+                "wb_scandoc_integration.scandoc_credit", parsed_data.get('user').get('remainingScans')
+            )
+        except requests.exceptions.RequestException as e:
+            raise UserError(f"ScanDoc API request failed: {e}")
+        self.file_scanned = True
+
+        # Initialize dictionaries for storing model values
+        po_vals, vendor_vals = {}, {}
+
+        data = parsed_data.get('extractedData')
+        vendor_vals.update({
+            'name': data.get('Vendor Name', ''),
+            'street': data.get('Vendor Address', ''),
+            'vat': data.get('Vendor GSTIN', ''),  # GSTIN stored in vat
+            'supplier_rank': 1,
+        })
+
+        vendor = self.env['res.partner'].sudo().search([
+            '|', ('name', '=', vendor_vals['name']),
+            ('vat', '=', vendor_vals['vat'])
+        ], limit=1)
+
+        if not vendor:
+            vendor = self.env['res.partner'].sudo().create(vendor_vals)
+        else:
+            vendor.write(vendor_vals)
+
+        invoice_date_str = data.get('Invoice Date')
+        # parsed_date = datetime.strptime(invoice_date_str, "%d/%m/%Y")
+        # date_order = fields.Datetime.to_string(parsed_date)
+
+        parsed_date = datetime.strptime(invoice_date_str, "%d/%m/%Y")
+        # Convert datetime object to Odoo format
+        date_order = fields.Datetime.to_string(parsed_date)
+
+        po_vals.update({
+            'partner_id': vendor.id,
+            'partner_ref': data.get('Invoice Number', ''),
+            'origin': data.get('Purchase Order Reference', ''),
+            'date_order': date_order,  # Will be parsed by Odoo
+            'currency_id': self.env['res.currency'].search([
+                ('name', '=', data.get('Currency', 'INR'))
+            ], limit=1).id,
+            'company_id': self.env.company.id if self.env.company else self.env.company.id,
+            'currency_id': self.env.company.currency_id.id if self.env.company and self.env.company.currency_id else self.env.company.currency_id.id,
+        })
+        po_line_vals = []
+
+        # 4. Prepare Purchase Order Lines
+        for item in data.get('Items', []):
+            # Search product by name or create if needed
+            product = self.env['product.product'].sudo().search([
+                ('name', '=', item.get('Description', ''))
+            ], limit=1)
+            if not product:
+                # Find or create UOM
+                uom_id = self.env['uom.uom'].search([
+                    ('name', '=ilike', item.get('UOM', 'Unit'))
+                ], limit=1)
+
+                if not uom_id:
+                    uom_id = self.env['uom.uom'].search([
+                        ('name', 'ilike', 'Unit')
+                ], limit=1)
+
+                # Create product
+                product = self.env['product.product'].sudo().create({
+                    'name': item.get('Description', ''),
+                    'uom_id': uom_id.id,
+                    'uom_po_id': uom_id.id,
+                    'default_code': item.get('HSN/SAC', '')
+                })
+
+            po_line_vals.append((0, 0, {
+                'product_id': product.id,
+                'name': item.get('Description', ''),
+                'product_qty': float(item.get('Quantity', 0)),
+                'product_uom': product.uom_id.id,
+                'price_unit': float(item.get('Unit Price', 0)),
+                'taxes_id': [
+                    (6, 0, self._get_tax_ids(item.get('Tax Rate (%)', 0)))
+                ] if item.get('Tax Rate (%)', 0) else [],
+            }))
+
+        po_vals['order_line'] = po_line_vals
+
+        if not self.env.context.get('active_id'):
+            # 5. Create Purchase Order
+            purchase_order = self.env['purchase.order'].sudo().create(po_vals)
+
+            # Attach the uploaded resume file
+            self.env['ir.attachment'].sudo().create({
+                'name': self.file_name,
+                'res_model': 'purchase.order',
+                'res_id': purchase_order.id,
+                'type': 'binary',
+                'datas': self.file,
+                'mimetype': mimetype,
+            })
+            return {
+                'type': 'ir.actions.act_window',
+                'res_model': 'purchase.order',
+                'res_id': purchase_order.id,
+                'view_mode': 'form',
+                'target': 'current',
+            }
+
+        # 5. Create Purchase Order
+        purchase_order = self.env['purchase.order'].sudo().search([
+            ('id', '=', self.env.context.get('active_id'))
+        ], limit=1)
+        purchase_order.write(po_vals)
+
+        # Attach the uploaded resume file
+        self.env['ir.attachment'].sudo().create({
+            'name': self.file_name,
+            'res_model': 'purchase.order',
+            'res_id': purchase_order.id,
+            'type': 'binary',
+            'datas': self.file,
+            'mimetype': mimetype,
+        })
+
+
+    def _get_tax_ids(self, tax_rate):
+        """Finds tax records by percentage."""
+        taxes = self.env['account.tax'].sudo().search([
+            ('amount', '=', float(tax_rate)),
+            ('type_tax_use', '=', 'purchase')
+        ])
+        return taxes.ids
+

@@ -1,0 +1,2116 @@
+# -*- coding: utf-8 -*-
+"""
+Production-ready ScanDoc Integration Module
+
+This module provides enterprise-grade document processing capabilities with:
+- Comprehensive error handling and logging
+- Input validation and security checks  
+- Robust currency detection and activation
+- Graceful failure recovery
+- Performance optimizations
+
+Author: Wan Buffer Services
+License: OPL-1
+Version: 18.0.1.0.0
+"""
+import re
+import io
+import json
+import base64
+import logging
+import mimetypes
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
+    
+try:
+    import requests
+except ImportError:
+    requests = None
+    
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+
+try:
+    from PyPDF2 import PdfReader
+except ImportError:
+    PdfReader = None
+
+try:
+    from PIL import Image, ImageOps, ImageFilter, ImageEnhance
+except ImportError:
+    Image = ImageOps = ImageFilter = ImageEnhance = None
+
+from odoo import models, fields, api, _
+from odoo.exceptions import UserError, ValidationError, AccessError
+
+_logger = logging.getLogger(__name__)
+
+# Production constants
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+ALLOWED_EXTENSIONS = ['.pdf', '.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.docx', '.xlsx']
+ALLOWED_MIME_TYPES = [
+    'application/pdf',
+    'image/png', 'image/jpeg', 'image/tiff', 'image/bmp',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+]
+
+_logger = logging.getLogger(__name__)
+
+
+class ResumeParserWizard(models.TransientModel):
+    """
+    Production-ready wizard for document processing with comprehensive error handling,
+    input validation, and security features.
+    """
+    _name = 'resume.parser.wizard'
+    _description = 'Resume Parser Wizard - Production Ready'
+
+    file = fields.Binary("File", required=True)
+    file_name = fields.Char("Filename", required=True)
+    file_scanned = fields.Boolean(string="File Scanned?")
+    doc_type = fields.Selection([
+        ('Resume', 'Resume'),
+        ('DeliveryChalaan', 'Delivery Challan'),
+        ('VendorBill', 'Vendor Bill')
+    ], string="Document Type")
+    doc_type_readonly = fields.Boolean(string="Readonly Doc Type",
+                                       compute="_compute_doc_type_readonly",
+                                       store=True)
+    
+    # Company validation fields
+    company_mismatch_detected = fields.Boolean(
+        string="Company Mismatch Detected", 
+        default=False,
+        help="Indicates if the invoice is addressed to a different company"
+    )
+    external_invoice_details = fields.Text(
+        string="External Invoice Details",
+        help="Details about the company mismatch for user review"
+    )
+    confirm_external_processing = fields.Boolean(
+        string="Confirm External Invoice Processing",
+        default=False,
+        help="User confirmation to process invoice for external company"
+    )
+    
+    # Data storage fields to avoid re-calling API
+    extracted_data_json = fields.Text(
+        string="Extracted Data (JSON)",
+        help="Stores extracted data from ScanDoc API to avoid re-processing"
+    )
+    data_extraction_completed = fields.Boolean(
+        string="Data Extraction Completed",
+        default=False,
+        help="Indicates if data has already been extracted from API"
+    )
+    api_call_timestamp = fields.Datetime(
+        string="API Call Timestamp",
+        help="When the API was last called for this file"
+    )
+    
+    @api.onchange('file', 'file_name')
+    def _onchange_file(self):
+        """Clear stored data when a new file is uploaded"""
+        if self.file and self.data_extraction_completed:
+            _logger.info("🔄 New file uploaded, clearing stored extracted data")
+            self._clear_extracted_data()
+            # Also reset company validation flags
+            self.company_mismatch_detected = False
+            self.external_invoice_details = False
+            self.confirm_external_processing = False
+
+    @api.onchange('confirm_external_processing')
+    def _onchange_confirm_external_processing(self):
+        """Handle confirmation checkbox changes"""
+        if self.confirm_external_processing and self.company_mismatch_detected:
+            _logger.info("✅ User confirmed external invoice processing")
+            # 🔧 FIX: Ensure the confirmation state is saved immediately
+            try:
+                self.sudo()._write({'confirm_external_processing': True})
+                _logger.info("🔧 Confirmation state saved to database")
+            except Exception as e:
+                _logger.warning("⚠️ Could not save confirmation state: %s", str(e))
+        elif not self.confirm_external_processing and self.company_mismatch_detected:
+            _logger.info("⚠️ User unchecked external invoice confirmation")
+            try:
+                self.sudo()._write({'confirm_external_processing': False})
+                _logger.info("🔧 Confirmation uncheck saved to database")
+            except Exception as e:
+                _logger.warning("⚠️ Could not save confirmation state: %s", str(e))
+
+    def _clear_extracted_data(self):
+        """Clear stored extracted data when needed"""
+        _logger.info("🧹 Clearing stored extracted data")
+        self.write({
+            'extracted_data_json': False,
+            'data_extraction_completed': False,
+            'api_call_timestamp': False,
+        })
+
+    def _store_extracted_data(self, data):
+        """Store extracted data to avoid re-calling API"""
+        try:
+            data_json = json.dumps(data, default=str, ensure_ascii=False)
+            self.write({
+                'extracted_data_json': data_json,
+                'data_extraction_completed': True,
+                'api_call_timestamp': fields.Datetime.now(),
+            })
+            _logger.info("💾 Stored extracted data in wizard (size: %d chars)", len(data_json))
+        except Exception as e:
+            _logger.error("❌ Failed to store extracted data: %s", str(e))
+
+    def _get_stored_data(self):
+        """Retrieve stored extracted data if available"""
+        _logger.info("🔍 Checking for stored data - completion flag: %s, data present: %s", 
+                    self.data_extraction_completed, bool(self.extracted_data_json))
+        
+        if self.data_extraction_completed and self.extracted_data_json:
+            try:
+                data = json.loads(self.extracted_data_json)
+                _logger.info("📥 Retrieved stored data from wizard (extracted at: %s, size: %d chars)", 
+                           self.api_call_timestamp, len(self.extracted_data_json))
+                return data
+            except Exception as e:
+                _logger.error("❌ Failed to parse stored data: %s", str(e))
+                self._clear_extracted_data()
+        else:
+            _logger.info("📭 No stored data available - will call API")
+        return None
+
+    @api.depends('doc_type')
+    def _compute_doc_type_readonly(self):
+        for record in self:
+            record.doc_type_readonly = self.env.context.get('readonly_doc_type', False)
+
+    # ===========================================
+    # PRODUCTION SECURITY & VALIDATION METHODS
+    # ===========================================
+    
+    def _check_dependencies(self):
+        """Check if all required Python packages are available"""
+        missing_deps = []
+        
+        if requests is None:
+            missing_deps.append('requests')
+        if openpyxl is None:
+            missing_deps.append('openpyxl')
+        if pytesseract is None:
+            missing_deps.append('pytesseract')
+        if PdfReader is None:
+            missing_deps.append('PyPDF2')
+        if Image is None:
+            missing_deps.append('Pillow')
+            
+        if missing_deps:
+            raise UserError(_(
+                "Missing required Python packages: %s\n"
+                "Please install them using: pip install %s"
+            ) % (', '.join(missing_deps), ' '.join(missing_deps)))
+    
+    def _validate_file_security(self):
+        """Comprehensive file validation for security and compatibility"""
+        if not self.file or not self.file_name:
+            raise ValidationError(_("File and filename are required"))
+            
+        # Check file size
+        file_data = base64.b64decode(self.file)
+        if len(file_data) > MAX_FILE_SIZE:
+            raise ValidationError(_(
+                "File size exceeds maximum limit of %sMB"
+            ) % (MAX_FILE_SIZE // (1024 * 1024)))
+        
+        # Check file extension
+        extension = self._get_file_extension(self.file_name)
+        if extension not in ALLOWED_EXTENSIONS:
+            raise ValidationError(_(
+                "File type '%s' not allowed. Supported formats: %s"
+            ) % (extension, ', '.join(ALLOWED_EXTENSIONS)))
+        
+        # Check MIME type
+        mime_type, _ = mimetypes.guess_type(self.file_name)
+        if mime_type and mime_type not in ALLOWED_MIME_TYPES:
+            raise ValidationError(_(
+                "MIME type '%s' not allowed for security reasons"
+            ) % mime_type)
+            
+        # Basic malware check - scan for suspicious patterns
+        try:
+            # Check for suspicious file headers/magic bytes
+            if file_data.startswith(b'MZ') and extension not in ['.exe', '.dll']:
+                raise ValidationError(_("Suspicious file detected - executable content in non-executable file"))
+                
+            # Check for embedded scripts in PDF
+            if extension == '.pdf' and b'/JavaScript' in file_data:
+                _logger.warning("PDF with JavaScript detected: %s", self.file_name)
+                
+        except Exception as e:
+            _logger.error("File validation error: %s", str(e))
+            raise ValidationError(_("File validation failed: %s") % str(e))
+    
+    def _get_safe_filename(self):
+        """Sanitize filename for safe processing"""
+        if not self.file_name:
+            return "unknown_file"
+            
+        # Remove path separators and dangerous characters
+        safe_name = re.sub(r'[^\w\-_\.]', '_', self.file_name)
+        # Ensure it's not too long
+        if len(safe_name) > 255:
+            name_part = safe_name[:240]
+            extension = self._get_file_extension(safe_name)
+            safe_name = name_part + extension
+            
+        return safe_name
+    
+    def _log_processing_start(self):
+        """Log the start of document processing for audit trail"""
+        _logger.info(
+            "Document processing started - User: %s, File: %s, Type: %s, Size: %s bytes",
+            self.env.user.name,
+            self._get_safe_filename(),
+            self.doc_type or 'Unknown',
+            len(base64.b64decode(self.file)) if self.file else 0
+        )
+
+    def _get_file_extension(self, filename):
+        """
+        Extracts the file extension from a filename.
+
+        :param filename: The name of the file.
+        :return: File extension with a leading dot (e.g., '.pdf').
+        """
+        return '.' + filename.split('.')[-1].lower() if '.' in filename else ''
+
+    def generate_sentiment_visual(self, sentiment_score):
+        """
+        Generate an emoji and label representation for a given sentiment score.
+
+        :param sentiment_score: The sentiment score as an integer.
+        :return: A string with visual (emoji) feedback.
+        """
+
+        result = ""
+        if 70 <= sentiment_score <= 100:
+            result = "🟢 (Positive) - Great Fit!"
+        elif 60 <= sentiment_score <= 69:
+            result = "🟡 (Neutral) - Potential Fit"
+        elif 0 <= sentiment_score < 60:
+            result = "🔴 (Negative) - Weak Fit"
+        else:
+            result = "⚪ (Invalid Score)"
+        return result
+
+    def process_resume(self):
+        self = self.sudo()
+        """
+        Main entry point to parse a resume.
+        It sends the uploaded file to ScanDoc,
+        interprets the response, and updates or creates partner,
+        candidate, and applicant records. Also attaches the resume and
+        adds sentiment analysis.
+        """
+        self.ensure_one()
+
+        # 🔑 Auth Key
+        auth_key = self.env['ir.config_parameter'].sudo().get_param(
+            'wb_scandoc_integration.scandoc_auth_key'
+        )
+        if not auth_key:
+            raise UserError(_("Missing ScanDoc authentication key in system parameters."))
+
+        if not self.file or not self.file_name:
+            raise UserError(_("Please upload a valid file."))
+
+        try:
+            file_content = base64.b64decode(self.file)
+        except Exception as e:
+            raise UserError(_("Error decoding uploaded file: %s") % str(e))
+
+        mimetype, encoding = mimetypes.guess_type(self.file_name)
+        mimetype = mimetype or "application/octet-stream"
+
+        allowed_mimetypes = [
+            "application/pdf", "image/jpeg", "image/png",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/msword",
+        ]
+        if mimetype not in allowed_mimetypes:
+            raise UserError(_(
+                "Unsupported file type: %s. Please upload PDF, DOCX, JPG or PNG files only."
+            ) % mimetype)
+
+        url = "https://scandocapi--scandoc-api.us-central1.hosted.app/external-extract"
+
+        try:
+            response = requests.post(
+                url,
+                data={'authKey': auth_key, 'doc_type': self.doc_type.lower()},
+                files=[('file', (self.file_name, file_content, mimetype))]
+            )
+            parsed_data = response.json()
+
+            if parsed_data.get("error"):
+                raise ValidationError(_(parsed_data.get("error")))
+
+            user_data = parsed_data.get("user", {})
+            if not user_data.get("remainingScans") or user_data.get("remainingScans") <= 0:
+                raise ValidationError(_("You exceed your Scandoc Credit Limit. Please purchase new credits."))
+
+            self.env["ir.config_parameter"].sudo().set_param(
+                "wb_scandoc_integration.scandoc_credit",
+                user_data.get("remainingScans")
+            )
+        except requests.exceptions.RequestException as e:
+            raise UserError(f"ScanDoc API request failed: {e}")
+
+        self.file_scanned = True
+
+        # ✅ Initialize dicts
+        candidate_vals, application_vals, partner_vals = {}, {}, {}
+
+        extracted = parsed_data.get("extractedData", {}).get("data", {})
+        if extracted:
+            application_vals["sentiment_json_data"] = json.dumps(extracted)
+        # 🔹 Personal Info
+        personal_info = extracted.get("personal_information", {})
+        if personal_info.get("full_name"):
+            partner_vals.update({"type": "contact", "name": personal_info["full_name"]})
+            candidate_vals["partner_name"] = application_vals["partner_name"] = personal_info["full_name"]
+        if personal_info.get("email"):
+            partner_vals["email"] = candidate_vals["email_from"] = application_vals["email_from"] = personal_info["email"]
+        if personal_info.get("phone"):
+            partner_vals["phone"] = candidate_vals["partner_phone"] = application_vals["partner_phone"] = personal_info["phone"]
+        if personal_info.get("linkedin_profile"):
+            candidate_vals["linkedin_profile"] = application_vals["linkedin_profile"] = personal_info["linkedin_profile"]
+
+        # 🔹 Skills
+        skills = extracted.get("skills", {})
+        if skills:
+            candidate_vals["candidate_skill_ids"] = self._process_skills(skills)
+
+        # 🔹 Work Experience
+        work_experience = extracted.get("work_experience", [])
+        if work_experience:
+            total_months = 0
+            work_experience_lines = []
+            for exp in work_experience:
+                start_date = exp.get("start_date") or ""
+                end_date = exp.get("end_date") or ""
+                duration_str = exp.get("duration_human") or ""
+
+                months = int(exp.get("duration_months") or 0)
+                total_months += months
+
+                if not duration_str and months:
+                    years, rem_months = divmod(months, 12)
+                    if years and rem_months:
+                        duration_str = f"{years} years {rem_months} months"
+                    elif years:
+                        duration_str = f"{years} years"
+                    else:
+                        duration_str = f"{rem_months} months"
+
+                work_experience_lines.append((0, 0, {
+                    "company_name": exp.get("company") or "Unknown Company",
+                    "role": exp.get("position") or "",
+                    "start_date": start_date,
+                    "end_date": end_date or "Present",
+                    "duration": duration_str,
+                }))
+
+            application_vals["work_experience_ids"] = work_experience_lines
+
+            if total_months:
+                years, months = divmod(total_months, 12)
+                if years and months:
+                    total_display = f"{years} years {months} months"
+                elif years:
+                    total_display = f"{years} years"
+                else:
+                    total_display = f"{months} months"
+                application_vals["total_work_experience"] = total_display
+
+        # 🔹 Education
+        education = extracted.get("education", [])
+        if education:
+            application_vals["education_ids"] = [
+                (0, 0, {
+                    "degree": edu.get("degree") or "",
+                    "institution": edu.get("institution") or "",
+                    "degree_duration": f"{edu.get('start_date') or ''} - {edu.get('end_date') or ''}",
+                }) for edu in education
+            ]
+
+        # 🔹 Professional Summary
+        summary = extracted.get("professional_summary", {})
+        if summary.get("summary_text"):
+            application_vals["applicant_notes"] = summary.get("summary_text")
+
+        # 🔹 Create/Update Partner
+        partner = self.env["res.partner"].sudo().search([
+            ("name", "=", partner_vals.get("name")),
+            "|", ("email", "=", partner_vals.get("email") or ""),
+            ("phone", "=", partner_vals.get("phone") or "")
+        ], limit=1)
+        partner = partner or self.env["res.partner"].sudo().create(partner_vals)
+        partner.write(partner_vals)
+
+        # 🔹 Create/Update Candidate
+        candidate = self.env["hr.candidate"].sudo().search([
+            ("partner_id", "=", partner.id)
+        ], order="id desc", limit=1)
+        if not candidate:
+            candidate = self.env["hr.candidate"].sudo().create(candidate_vals)
+        else:
+            with self.env.cr.savepoint():
+                candidate.candidate_skill_ids.unlink()
+            candidate.write(candidate_vals)
+
+        # 🔹 Create/Update Applicant
+        application_vals["candidate_id"] = candidate.id
+        application_vals["stage_id"] = self.env.ref('hr_recruitment.stage_job0').id
+        application = self.env["hr.applicant"].sudo().browse(self.env.context.get("active_id"))
+        if application:
+            application.sudo().write(application_vals)
+        else:
+            application = self.env["hr.applicant"].sudo().create(application_vals)
+
+        # 🔹 Attach File
+        self.env["ir.attachment"].sudo().create({
+            "name": self.file_name,
+            "res_model": "hr.applicant",
+            "res_id": application.sudo().id,
+            "type": "binary",
+            "datas": self.file,
+            "mimetype": mimetype,
+        })
+
+        if not self.env.context.get("active_id"):
+            return {
+                "type": "ir.actions.act_window",
+                "res_model": "hr.applicant",
+                "res_id": application.sudo().id,
+                "view_mode": "form",
+                "target": "current",
+            }
+
+    def _process_skills(self, skills_dict):
+        """
+        Converts parsed skill data into one2many-compatible format.
+        Creates skill types and skills as needed.
+
+        :param skills_dict: Dictionary of skill categories and their skills.
+        :return: List of tuples for candidate_skill_ids.
+        """
+        skill_lines = []
+        for category, skills in skills_dict.items():
+            skill_type = self.env['hr.skill.type'].sudo().search(
+                [('name', '=', category)], limit=1
+            )
+            if not skill_type:
+                skill_type = self.env['hr.skill.type'].sudo().create(
+                    {'name': category}
+                )
+
+            for skill_name in skills:
+                skill = self.env['hr.skill'].sudo().search([
+                    ('name', '=', skill_name),
+                    ('skill_type_id', '=', skill_type.id)
+                ], limit=1)
+                if not skill:
+                    skill = self.env['hr.skill'].sudo().create({
+                        'name': skill_name,
+                        'skill_type_id': skill_type.id
+                    })
+                level = self.env['hr.skill.level'].sudo().search([
+                    ('skill_type_id', '=', skill_type.id)
+                ], limit=1)
+                if not level:
+                    level = self.env['hr.skill.level'].sudo().create({
+                        'name': 'Beginner',
+                        'skill_type_id': skill_type.id,
+                        'level_progress': 0,
+                    })
+                skill_lines.append((0, 0, {
+                    'skill_id': skill.id,
+                    'skill_type_id': skill_type.id,
+                    'skill_level_id': level.id
+                }))
+        return skill_lines
+
+    def _build_sentiment_html(self, score, sentiment_data, tone_data):
+        """
+        Builds a styled HTML block for visualizing sentiment and tone data.
+
+        :param score: Overall sentiment score as integer.
+        :param sentiment_data: Dictionary of sentiment scores and justifications.
+        :param tone_data: Dictionary of tone interpretations and keyword counts.
+        :return: HTML string to be rendered in the applicant form.
+        """
+        visual = self.generate_sentiment_visual(score)
+        stability = sentiment_data.get("Work Stability Check", {})
+
+        html = f"""
+               <div style="max-width: 600px; margin: auto; background: rgba(0,0,0,0.05);
+                           padding: 24px; border-radius: 16px;
+                           box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
+                   <!-- Section Header -->
+                   <h2 style="margin-top: 0; font-size: 24px; color: #222;">Sentiment Analysis</h2>
+
+                   <!-- Sentiment Block -->
+                   <div style="border: 1px solid #eee; border-radius: 12px; padding: 16px;
+                               margin-bottom: 24px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.30);
+                               background-color: #f9f9f9;">
+                       <p style="margin: 0; font-size: 16px;">
+                           <span style="font-size: 20px;">🎯 
+                               <strong>Sentiment Analysis</strong>
+                           </span>
+                       </p>
+                       <p style="margin: 4px 0;"><strong>Overall Sentiment:</strong> {visual}</p>
+                       <p style="margin: 4px 0;"><strong>Polarity Score:</strong> {score}%</p>
+                       <p style="margin: 4px 0;"><strong>Subjectivity Score:</strong>
+                           {sentiment_data.get('Subjectivity Score')}
+                       </p>
+                       <p style="margin: 4px 0;"><strong>Justification:</strong>
+                           {sentiment_data.get('Justification')}
+                       </p>
+                   </div>
+
+                   <!-- Work Stability -->
+                   <div style="background: #fff1f0; border-left: 5px solid #ff4d4f;
+                               border-radius: 12px; padding: 16px; margin-bottom: 24px;
+                               box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+                               transition: box-shadow 0.3s ease;">
+                       <p style="margin: 0; font-size: 16px;">
+                           <span style="font-size: 18px;">🔴</span>
+                           <strong>Work Stability Check</strong>
+                       </p>
+                       <p style="margin: 6px 0;"><strong>Risk Level:</strong>
+                           {stability.get('Risk Level')}
+                       </p>
+                       <p style="margin: 6px 0;"><strong>Job Changes in Last 6 Months:</strong>
+                           {stability.get('Job Changes in Last 6 Months')}
+                       </p>
+                       <p style="margin: 6px 0;"><strong>Job Changes in Last 1 Year:</strong> 
+                           {stability.get('Job Changes in Last 1 Year')}
+                       </p>
+                       <p style="margin: 6px 0;"><strong>Average Tenure per Company:</strong>
+                           {stability.get('Average Tenure per Company')}
+                       </p>
+                       <p style="margin: 6px 0;"><strong>Assessment:</strong>
+                           {stability.get('Stability Assessment')}
+                       </p>
+                   </div>
+
+                   <div style="border: 1px solid #eee; border-radius: 12px; padding: 16px;
+                               box-shadow: 0 6px 20px rgba(0, 0, 0, 0.30); background-color: #f9f9f9;">
+                       <h3 style="margin-top: 0; font-size: 18px;">Tone Detection</h3>
+                       <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+                   </div>
+               </div>
+            """
+
+        def find_emoji(interpretation=''):
+            emoji_map = {
+                'Leadership': '\U0001F60A',  # 😊
+                'Managerial': '\U0001F468\u200D\U0001F4BC',  # 👨‍💼
+                'Individual Contributions': '\U0001F9CD',  # 🧍
+                'Confidence': '\U0001F512',  # 🔒
+                'Problem-Solving': '\U0001F9E9',  # 🧩
+                'Communication': '\U0001F4AC',  # 💬
+                'Technical': '\U0001F6E0\ufe0f',  # 🛠️
+            }
+            return emoji_map.get(interpretation, '')
+
+        for tone, details in tone_data.items():
+            emoji = find_emoji(tone)
+            html += f"""
+               <tr>
+                 <td>{emoji} <strong>{tone}: </strong></td>
+                 <td style="text-align: right;">{details.get('Keyword Count')}</td>
+               </tr>"""
+        html += f"""
+               </table>
+               </div>
+               </div>
+           """
+        return html
+
+    def process_purchase_receipt(self):
+        """
+        Main entry point to parse a resume.
+        It sends the uploaded file to ScanDoc,
+        interprets the response, and updates or creates partner,
+        candidate, and
+        applicant records. Also attaches the resume and
+        adds sentiment analysis.
+
+        :return: Action to open the related applicant form view.
+        """
+        self.ensure_one()
+        # scandoc_manager_ids = self.env['scandoc.manager'].sudo().search([])
+        # remaining_credit = sum(scandoc_manager_ids.mapped('remaining_credit'))
+        # if remaining_credit <= 0:
+        #     raise ValidationError(_("You exceed your Scandoc Credit Limit. Please purchase new credits."))
+
+        # Get ScanDoc API Auth Key
+        auth_key = self.env['ir.config_parameter'].sudo().get_param(
+            'wb_scandoc_integration.scandoc_auth_key')
+        if not auth_key:
+            raise UserError(_(
+                "Missing ScanDoc authentication key in system parameters."
+            ))
+
+        if not self.file or not self.file_name:
+            raise UserError("Please upload a valid file.")
+
+        # Prepare file and metadata
+        file_content = ''
+        try:
+            file_content = base64.b64decode(self.file)
+        except Exception as e:
+            raise UserError(_("Error decoding uploaded file: %s") % str(e))
+
+        # Detect MIME type dynamically
+        mimetype, encoding = mimetypes.guess_type(self.file_name)
+        mimetype = mimetype or 'application/octet-stream'
+
+        # Optional: Validate allowed file types
+        allowed_mimetypes = [
+            'application/pdf', 'image/jpeg', 'image/png',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # .docx
+            'application/msword',  # .doc
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',  # .xlsx
+            'application/vnd.ms-excel',  # .xls
+        ]
+        if mimetype not in allowed_mimetypes:
+            raise UserError(_(
+                "Unsupported file type: %s. Please upload PDF, DOCX, JPG or PNG files only."
+            ) % mimetype)
+
+        # Example logging
+        mimetype = (mimetypes.guess_type(self.file_name)[0]
+                    or 'application/octet-stream')
+        url = ("https://scandocapi--scandoc-api."
+               "us-central1.hosted.app/api/documents/scan")
+
+        try:
+            # Send file to ScanDoc
+            doc_type_map = {
+                "Delivery Challan": "DeliveryChalaan",
+                "Vendor Bill": "VendorBill",
+                "Resume": "Resume",
+            }
+            doc_type = doc_type_map.get(self.doc_type, self.doc_type)
+            if not doc_type:
+                raise UserError("Document type not specified or incorrect.")
+
+            response = requests.post(
+                url,
+                data={'authKey': auth_key, 'doc_type': doc_type},
+                files=[('file', (self.file_name, file_content, mimetype))]
+            )
+            parsed_data = response.json()
+            if parsed_data.get('error'):
+                raise ValidationError(_(f"{parsed_data.get('error')}"))
+            if not parsed_data.get('user') or not parsed_data.get('user').get('remainingScans') or parsed_data.get('user').get('remainingScans') < 0:
+                raise ValidationError(_("You exceed your Scandoc Credit Limit. Please purchase new credits."))
+            self.env["ir.config_parameter"].sudo().set_param(
+                "wb_scandoc_integration.scandoc_credit", parsed_data.get('user').get('remainingScans')
+            )
+        except requests.exceptions.RequestException as e:
+            raise UserError(f"ScanDoc API request failed: {e}")
+        self.file_scanned = True
+
+        # Initialize dictionaries for storing model values
+        api_data = parsed_data.get('extractedData')
+
+        gstin_number = None
+
+        # GSTIN regex (15 characters, standard format)
+        extracted_text = ""
+
+        # If PDF
+        if mimetype == "application/pdf":
+            try:
+                pdf_file = io.BytesIO(file_content)
+                reader = PdfReader(pdf_file)
+                for page in reader.pages:
+                    extracted_text += page.extract_text() or ""
+            except Exception as e:
+                _logger.warning("PDF GSTIN extraction failed: %s", e)
+
+        # If DOCX
+        elif mimetype in [
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel"
+        ]:
+            try:
+                wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True)
+                extracted_text = ""
+                for sheet in wb.worksheets:
+                    for row in sheet.iter_rows(values_only=True):
+                        row_text = " ".join([str(cell) for cell in row if cell])
+                        if row_text.strip():
+                            extracted_text += " " + row_text
+                _logger.info("Extracted Excel Text (first 300 chars): %s", extracted_text[:300])
+            except Exception as e:
+                _logger.warning("Excel GSTIN extraction failed: %s", e)
+
+        # If Image (PNG/JPG) – use OCR
+        elif mimetype in ["image/jpeg", "image/png"]:
+            try:
+                 # Open the image
+                image = Image.open(io.BytesIO(file_content))
+
+                # Convert to grayscale (helps simplify the text extraction)
+                image = image.convert('L')
+
+                # Resize the image to make text clearer (doubling the resolution)
+                image = image.resize((image.width * 2, image.height * 2))  # Experiment with this factor
+
+                # Thresholding: Convert the image into a binary format (black and white)
+                image = image.point(lambda p: p > 180 and 255)  # Adjust threshold value (180) as needed
+
+                # Invert the image colors (make text black and background white)
+                image = ImageOps.invert(image)
+
+                # Optional: Apply median filter (reduces noise) and sharpen the image
+                image = image.filter(ImageFilter.MedianFilter(3))  # Try different filter sizes (3, 5, etc.)
+                image = image.filter(ImageFilter.SHARPEN)
+
+                # Enhance contrast to make text stand out more clearly
+                enhancer = ImageEnhance.Contrast(image)
+                image = enhancer.enhance(2)  # Try different values for better contrast
+
+                # Use pytesseract to extract the text
+                custom_config = r'--oem 3 --psm 6'  # Use LSTM OCR model
+                extracted_text = pytesseract.image_to_string(image, config=custom_config)
+            except Exception as e:
+                _logger.warning("OCR GSTIN extraction failed: %s", e)
+                return ""
+            extracted_text = extracted_text.replace("\n", " ").replace("\r", " ").strip()
+        # Regular expression for GST number
+        gstin_pattern = r"\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]{3}\b"
+        # Find GSTIN matches in the extracted text
+        gstin_matches = re.findall(gstin_pattern, extracted_text)
+
+        # Clean extracted text (remove newlines, extra spaces, etc.)
+        extracted_text = extracted_text.replace("\n", " ").replace("\r", " ").strip()
+
+        # Regular expression for GST number
+        gstin_pattern = r"\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]{3}\b"
+
+        # Find GSTIN matches in the extracted text
+        gstin_matches = re.findall(gstin_pattern, extracted_text)
+
+        if gstin_matches:
+            gstin_number = gstin_matches[0]
+        else:
+            gstin_number = ''
+        picking_type = self.env['stock.picking.type'].search([
+            ('code', '=', 'incoming'),
+            ('warehouse_id.company_id', '=', self.env.company.id)
+        ], limit=1)
+        if not picking_type:
+            raise ValueError("No Incoming Picking Type found for this company.")
+
+        # 2️⃣ Get or create partner (Consignor = vendor)
+        partner = self.env['res.partner'].search([
+            ('name', '=', api_data.get('Consignor Name'))
+        ], limit=1)
+
+        if not partner:
+            partner = self.env['res.partner'].create({
+                'name': api_data.get('Consignor Name'),
+                'street': api_data.get('Consignor Address'),
+                'company_type': 'company',
+            })
+
+        # 3️⃣ Prepare stock.move lines
+        move_lines = []
+        for item in api_data.get('Items', []):
+            product = self.env['product.product'].search([
+                ('default_code', '=', item.get('HSN/SAC'))
+            ], limit=1)
+
+            if not product:
+                # Create placeholder product if not exists
+                product = self.env['product.product'].create({
+                    'name': item.get('Description'),
+                    'default_code': item.get('HSN/SAC'),
+                    'type': 'consu',
+                    'uom_id': self.env.ref('uom.product_uom_unit').id,
+                    'uom_po_id': self.env.ref('uom.product_uom_unit').id,
+                })
+
+            move_lines.append((0, 0, {
+                'name': item.get('Description'),
+                'product_id': product.id,
+                'product_uom_qty': float(item.get('Quantity', 0)),
+                'product_uom': product.uom_id.id,
+                'location_id': picking_type.default_location_src_id.id,
+                'location_dest_id': picking_type.default_location_dest_id.id,
+            }))
+        challan_date_str = api_data.get("Challan Date")
+        scheduled_date = False
+        if challan_date_str:
+            challan_date_str = challan_date_str.strip()
+            _logger.info("👉 Raw challan_date_str: %r", challan_date_str)
+            try:
+                scheduled_date = self.parse_date(challan_date_str)
+            except ValueError:
+                raise UserError(_("Invalid date format in Challan Date: %s") % challan_date_str)
+
+        challan_number = api_data.get("Challan Number")
+
+        # ✅ Check if challan number already exists
+        if challan_number:
+            exists = self.env['stock.picking'].search([('challan_number', '=', challan_number)])
+            if exists:
+                raise ValidationError(_("A record with Challan Number %s already exists!") % challan_number)
+        # 4️⃣ Create the picking
+        picking_vals = {
+            'picking_type_id': picking_type.id,
+            'partner_id': partner.id,
+            'origin': api_data.get('Reference Number') or api_data.get('Challan Number'),
+            'scheduled_date': scheduled_date,
+            'move_ids_without_package': move_lines,
+            'challan_number':api_data.get('Challan Number'),
+            'vehicle_number':api_data.get("Transport Details", {}).get("Vehicle Number"),
+            'transport_name':api_data.get("Transport Details", {}).get("Transporter Name"),
+            'dispatch_location':api_data.get('Dispatch From'),
+            'transport_doc_no': api_data.get("Transport Details", {}).get("LR Number"),
+        }
+
+        picking = self.env['stock.picking'].create(picking_vals)
+        picking.write({'vendor_gst_number': False})
+        picking.write({'vendor_gst_number': gstin_number or ''})
+        # # Attach the uploaded resume file
+        self.env['ir.attachment'].sudo().create({
+            'name': self.file_name,
+            'res_model': 'stock.picking',
+            'res_id': picking.id,
+            'type': 'binary',
+            'datas': self.file,
+            'mimetype': mimetype,
+        })
+
+        return {
+            'type': 'ir.actions.act_window',
+            'res_model': 'stock.picking',
+            'res_id': picking.id,
+            'view_mode': 'form',
+            'target': 'current',
+        }
+
+    def _calculate_line_pricing(self, item):
+        """
+        Intelligently calculate quantity and unit price from various possible field combinations.
+        Handles scenarios where API extracts different field names or misinterprets data.
+        
+        :param item: Line item dictionary from ScanDoc API
+        :return: tuple (quantity, unit_price)
+        """
+        # Get quantity with various possible field names
+        quantity_fields = ['Quantity', 'Qty', 'Units', 'Count', 'No.', 'Pieces']
+        quantity = 1.0  # Default quantity
+        
+        for field in quantity_fields:
+            if item.get(field):
+                try:
+                    quantity = float(self._clean_price_value(item.get(field, 1)))
+                    if quantity > 0:
+                        _logger.info("   - Found quantity from field '%s': %s", field, quantity)
+                        break
+                except (ValueError, TypeError):
+                    continue
+        
+        if quantity <= 0:
+            quantity = 1.0
+            _logger.info("   - Using default quantity: 1.0")
+        
+        # Get all possible price-related fields
+        price_fields = {
+            'unit_price': ['Unit Price', 'Price', 'Rate', 'Unit Rate', 'Price Per Unit', 'Each'],
+            'line_total': ['Amount', 'Total', 'Line Total', 'Subtotal', 'Total Amount', 'Line Amount'],
+            'extended': ['Extended Price', 'Extended Amount', 'Extension', 'Net Amount']
+        }
+        
+        # Extract and clean all available price values
+        extracted_prices = {}
+        
+        for category, fields in price_fields.items():
+            for field in fields:
+                if item.get(field):
+                    try:
+                        value = self._clean_price_value(item.get(field, 0))
+                        if value > 0:
+                            extracted_prices[f"{category}_{field}"] = value
+                            _logger.info("   - Found %s from '%s': %s", category, field, value)
+                    except (ValueError, TypeError):
+                        continue
+        
+        # Scenario analysis and unit price calculation
+        unit_price = 0.0
+        
+        # Scenario 1: Line total/amount available - calculate unit price
+        line_totals = [v for k, v in extracted_prices.items() if k.startswith('line_total_') or k.startswith('extended_')]
+        if line_totals:
+            line_total = max(line_totals)  # Use the largest if multiple
+            unit_price = line_total / quantity
+            _logger.info("   - Calculated unit price from line total: %s ÷ %s = %s", line_total, quantity, unit_price)
+            return quantity, unit_price
+        
+        # Scenario 2: Unit price available - validate it makes sense
+        unit_prices = [v for k, v in extracted_prices.items() if k.startswith('unit_price_')]
+        if unit_prices:
+            raw_unit_price = max(unit_prices)  # Use the largest if multiple
+            
+            # Validation: Check if this might actually be a line total
+            calculated_total = raw_unit_price * quantity
+            
+            # If the calculated total is unreasonably high, assume it's a misnamed line total
+            if quantity > 1 and raw_unit_price > 1000:
+                _logger.info("   - Unit price %s seems too high for qty %s, treating as line total", raw_unit_price, quantity)
+                unit_price = raw_unit_price / quantity
+            else:
+                unit_price = raw_unit_price
+                _logger.info("   - Using extracted unit price: %s", unit_price)
+            return quantity, unit_price
+        
+        # Scenario 3: Cross-validation when both types are available
+        if extracted_prices:
+            # Use any available price value and try to make sense of it
+            all_values = list(extracted_prices.values())
+            largest_value = max(all_values)
+            smallest_value = min(all_values)
+            
+            # If there's a big difference, larger is likely line total, smaller is unit price
+            if len(all_values) > 1 and largest_value > smallest_value * quantity * 0.8:
+                unit_price = largest_value / quantity  # Treat larger as line total
+                _logger.info("   - Using largest value as line total: %s ÷ %s = %s", largest_value, quantity, unit_price)
+            else:
+                unit_price = smallest_value  # Treat smaller as unit price
+                _logger.info("   - Using smallest value as unit price: %s", unit_price)
+            return quantity, unit_price
+        
+        # Scenario 4: Fallback - no price information found
+        _logger.warning("   - No valid price information found in item, using 0.0")
+        return quantity, 0.0
+
+    def parse_date(self, date_str):
+        if not date_str:
+            raise ValueError("Date string cannot be empty")
+        
+        # Clean the date string
+        date_str = str(date_str).strip()
+        
+        # List of supported date formats
+        date_formats = [
+            "%d/%m/%Y",    # 31/08/2025
+            "%m/%d/%Y",    # 08/31/2025
+            "%Y-%m-%d",    # 2025-08-31
+            "%d-%m-%Y",    # 31-08-2025
+            "%m-%d-%Y",    # 08-31-2025
+            "%d-%m-%y",    # 31-08-25 (2-digit year)
+            "%m-%d-%y",    # 08-31-25 (2-digit year)
+            "%d/%m/%y",    # 31/08/25 (2-digit year)
+            "%m/%d/%y",    # 08/31/25 (2-digit year)
+            "%Y/%m/%d",    # 2025/08/31
+            "%y/%m/%d",    # 25/08/31 (2-digit year)
+            "%d.%m.%Y",    # 31.08.2025
+            "%d.%m.%y",    # 31.08.25
+            "%Y.%m.%d",    # 2025.08.31
+            "%d %b %Y",    # 31 Aug 2025 (abbreviated month)
+            "%d %B %Y",    # 31 August 2025 (full month name)
+            "%b %d, %Y",   # Aug 31, 2025
+            "%B %d, %Y",   # August 31, 2025
+            "%d-%b-%Y",    # 31-Aug-2025
+            "%d-%B-%Y",    # 31-August-2025
+        ]
+        
+        for fmt in date_formats:
+            try:
+                return datetime.strptime(date_str, fmt)
+            except ValueError:
+                continue
+        raise ValueError(f"Date format not recognized: {date_str}")
+
+    def _detect_currency(self, data):
+        """
+        Detect and map currency from ScanDoc response data with enhanced logging.
+        Handles both currency names and symbols with proper mapping.
+        """
+        currency_mapping = {
+            # Currency symbols to currency codes
+            'R': 'ZAR',      # South African Rand symbol
+            'r': 'ZAR',      # Lowercase variant
+            '$': 'USD',      # US Dollar symbol
+            '€': 'EUR',      # Euro symbol
+            '£': 'GBP',      # British Pound symbol
+            '¥': 'JPY',      # Japanese Yen symbol
+            '₹': 'INR',      # Indian Rupee symbol
+            # Currency codes (direct mapping)
+            'ZAR': 'ZAR',    # South African Rand
+            'USD': 'USD',    # US Dollar
+            'EUR': 'EUR',    # Euro
+            'GBP': 'GBP',    # British Pound
+            'JPY': 'JPY',    # Japanese Yen
+            'INR': 'INR',    # Indian Rupee
+            'CAD': 'CAD',    # Canadian Dollar
+            'AUD': 'AUD',    # Australian Dollar
+            'CHF': 'CHF',    # Swiss Franc
+            'CNY': 'CNY',    # Chinese Yuan
+        }
+        
+        # Check for currency in data
+        detected_currency = None
+        currency_value = data.get('Currency', '').strip()
+        
+        _logger.info(f"🔍 Starting currency detection process...")
+        _logger.info(f"📋 Raw currency field: '{currency_value}'")
+        
+        if currency_value:
+            # Direct lookup in mapping
+            detected_currency = currency_mapping.get(currency_value)
+            _logger.info(f"💰 Direct currency mapping: '{currency_value}' -> '{detected_currency}'")
+        
+        # If no direct match, try to find currency symbols in the data
+        if not detected_currency:
+            # Look for currency symbols in various fields
+            fields_to_check = ['Total', 'Subtotal', 'Amount', 'Currency', 'TotalAmount']
+            _logger.info(f"🔎 No direct match, checking fields for currency symbols: {fields_to_check}")
+            
+            for field in fields_to_check:
+                field_value = str(data.get(field, ''))
+                if field_value:
+                    _logger.info(f"🔍 Checking field '{field}': '{field_value}'")
+                    for symbol, currency_code in currency_mapping.items():
+                        if symbol in field_value:
+                            detected_currency = currency_code
+                            _logger.info(f"✅ Currency symbol '{symbol}' found in field '{field}': '{field_value}' -> mapped to: '{detected_currency}'")
+                            break
+                if detected_currency:
+                    break
+        
+        if detected_currency:
+            # Use the enhanced currency activation method
+            _logger.info(f"🎯 Detected currency: {detected_currency}, proceeding with activation...")
+            currency_record = self._activate_currency(detected_currency)
+            if currency_record:
+                _logger.info(f"✅ Currency ready for use: {detected_currency} (ID: {currency_record.id}, Symbol: '{currency_record.symbol}', Active: {currency_record.active})")
+                return currency_record
+            else:
+                _logger.error(f"❌ Failed to activate or create currency: {detected_currency}")
+        
+        _logger.info("ℹ️ No currency detected, will use company default currency")
+        return None
+
+    def _activate_currency(self, currency_code):
+        """
+        Manually activate a specific currency by currency code with enhanced verification.
+        If currency doesn't exist, create it with proper symbol configuration.
+        
+        :param currency_code: Currency code (e.g., 'ZAR', 'USD', 'EUR')
+        :return: Currency record if found/created and activated, None otherwise
+        """
+        # First check for active currency
+        currency_record = self.env['res.currency'].search([
+            ('name', '=', currency_code),
+            ('active', '=', True)
+        ], limit=1)
+        
+        if currency_record:
+            _logger.info(f"💰 Currency {currency_code} was already active with symbol: '{currency_record.symbol}'")
+            return currency_record
+        
+        # Check for inactive currency (including inactive ones)
+        currency_record = self.env['res.currency'].with_context(active_test=False).search([
+            ('name', '=', currency_code)
+        ], limit=1)
+        
+        if currency_record:
+            if not currency_record.active:
+                try:
+                    currency_record.active = True
+                    _logger.info(f"✅ Manually activated currency: {currency_code} with symbol '{currency_record.symbol}' (ID: {currency_record.id})")
+                except Exception as e:
+                    _logger.error(f"❌ Failed to manually activate currency {currency_code}: {str(e)}")
+                    return None
+            
+            # Verify the currency has proper symbol configuration
+            expected_symbols = {
+                'ZAR': 'R',
+                'USD': '$',
+                'EUR': '€',
+                'GBP': '£',
+                'JPY': '¥',
+                'INR': '₹'
+            }
+            
+            expected_symbol = expected_symbols.get(currency_code)
+            if expected_symbol and currency_record.symbol != expected_symbol:
+                _logger.warning(f"⚠️ Currency {currency_code} symbol mismatch: Expected '{expected_symbol}', found '{currency_record.symbol}'")
+                try:
+                    currency_record.symbol = expected_symbol
+                    _logger.info(f"🔧 Updated currency {currency_code} symbol to '{expected_symbol}'")
+                except Exception as e:
+                    _logger.error(f"❌ Failed to update currency symbol: {str(e)}")
+            
+            return currency_record
+        else:
+            # Currency doesn't exist, try to create it
+            _logger.info(f"🆕 Currency {currency_code} not found, creating new currency record...")
+            return self._create_currency(currency_code)
+
+    def _create_currency(self, currency_code):
+        """
+        Create a new currency record in Odoo with proper symbol configuration.
+        
+        :param currency_code: Currency code (e.g., 'ZAR', 'USD', 'EUR')
+        :return: Currency record if created successfully, None otherwise
+        """
+        # Enhanced currency definitions with proper symbols and formatting
+        currency_definitions = {
+            'ZAR': {'name': 'ZAR', 'full_name': 'South African Rand', 'symbol': 'R', 'rounding': 0.01, 'position': 'before'},
+            'USD': {'name': 'USD', 'full_name': 'US Dollar', 'symbol': '$', 'rounding': 0.01, 'position': 'before'},
+            'EUR': {'name': 'EUR', 'full_name': 'Euro', 'symbol': '€', 'rounding': 0.01, 'position': 'after'},
+            'GBP': {'name': 'GBP', 'full_name': 'British Pound', 'symbol': '£', 'rounding': 0.01, 'position': 'before'},
+            'JPY': {'name': 'JPY', 'full_name': 'Japanese Yen', 'symbol': '¥', 'rounding': 1.0, 'position': 'before'},
+            'INR': {'name': 'INR', 'full_name': 'Indian Rupee', 'symbol': '₹', 'rounding': 0.01, 'position': 'before'},
+            'CAD': {'name': 'CAD', 'full_name': 'Canadian Dollar', 'symbol': 'CAD$', 'rounding': 0.01, 'position': 'before'},
+            'AUD': {'name': 'AUD', 'full_name': 'Australian Dollar', 'symbol': 'AUD$', 'rounding': 0.01, 'position': 'before'},
+            'CHF': {'name': 'CHF', 'full_name': 'Swiss Franc', 'symbol': 'CHF', 'rounding': 0.01, 'position': 'before'},
+            'CNY': {'name': 'CNY', 'full_name': 'Chinese Yuan', 'symbol': '¥', 'rounding': 0.01, 'position': 'before'},
+        }
+        
+        currency_def = currency_definitions.get(currency_code)
+        if not currency_def:
+            _logger.warning(f"No definition found for currency {currency_code}")
+            return None
+        
+        try:
+            # Create currency with enhanced symbol configuration
+            currency_vals = {
+                'name': currency_def['name'],
+                'symbol': currency_def['symbol'],
+                'rounding': currency_def['rounding'],
+                'position': currency_def['position'],
+                'active': True,
+            }
+            
+            # Add full_name only if it exists in the currency model
+            if hasattr(self.env['res.currency'], 'full_name'):
+                currency_vals['full_name'] = currency_def['full_name']
+                
+            currency_record = self.env['res.currency'].create(currency_vals)
+            
+            _logger.info(f"✅ Successfully created currency: {currency_code} with symbol '{currency_def['symbol']}' (ID: {currency_record.id})")
+            
+            # Verify currency configuration
+            if currency_record.symbol == currency_def['symbol']:
+                _logger.info(f"💰 Currency symbol verification passed: {currency_record.symbol}")
+            else:
+                _logger.warning(f"⚠️ Currency symbol mismatch: Expected '{currency_def['symbol']}', got '{currency_record.symbol}'")
+            
+            return currency_record
+        except Exception as e:
+            _logger.error(f"❌ Failed to create currency {currency_code}: {str(e)}")
+            return None
+
+    def test_currency_activation(self):
+        """
+        Test method to activate common currencies programmatically.
+        This can be called to ensure required currencies are available.
+        """
+        common_currencies = ['ZAR', 'USD', 'EUR', 'GBP', 'JPY', 'INR']
+        activated_currencies = []
+        
+        for currency_code in common_currencies:
+            currency = self._activate_currency(currency_code)
+            if currency:
+                activated_currencies.append(currency_code)
+        
+        _logger.info(f"Currency activation test completed. Activated: {activated_currencies}")
+        return activated_currencies
+
+    def _clean_price_value(self, price_str):
+        """
+        Clean price string by removing currency symbols and converting to float.
+        
+        :param price_str: Price string that might contain currency symbols
+        :return: Float value of the price
+        """
+        if not price_str:
+            return 0.0
+            
+        # Convert to string if it's not already
+        price_str = str(price_str).strip()
+        
+        if not price_str:
+            return 0.0
+            
+        # Remove common currency symbols
+        currency_symbols = ['R', '$', '€', '£', '¥', '₹', '₦', '₵', '₡', '₪', '₫', '₩', '₽', '₴', '₸', '₹']
+        
+        # Clean the price string
+        cleaned_price = price_str
+        for symbol in currency_symbols:
+            cleaned_price = cleaned_price.replace(symbol, '').strip()
+        
+        # Remove commas and other formatting
+        cleaned_price = cleaned_price.replace(',', '').replace(' ', '')
+        
+        try:
+            return float(cleaned_price)
+        except (ValueError, TypeError):
+            _logger.warning(f"Could not convert price '{price_str}' to float, returning 0.0")
+            return 0.0
+
+    def process_purchase_order(self):
+        """
+        Production-ready main entry point for document processing.
+        Includes comprehensive error handling, validation, and logging.
+        
+        :return: Action to open the related document form view.
+        """
+        self.ensure_one()
+        
+        # 🔧 FIX: Force save the wizard state before validation check
+        # This ensures confirmation state is persisted between wizard calls
+        try:
+            if hasattr(self, '_origin') and self._origin:
+                # If this is a modified record, save it to ensure state persistence
+                self.sudo()._flush_recordset()
+                _logger.info("🔧 Wizard state flushed for persistence")
+        except Exception as e:
+            _logger.warning("⚠️ Could not flush wizard state: %s", str(e))
+        
+        _logger.info("🔍 PROCESSING START - Confirmation state: %s, Mismatch detected: %s", 
+                    self.confirm_external_processing, self.company_mismatch_detected)
+        
+        # Check if company validation confirmation is required
+        if self.company_mismatch_detected and not self.confirm_external_processing:
+            _logger.warning("🔄 Company mismatch detected but user has not confirmed - showing confirmation UI")
+            raise UserError(
+                "⚠️ Security Confirmation Required!\n\n"
+                "This invoice is addressed to an external company. "
+                "Please review the details above and check the confirmation box "
+                "if you are authorized to process this external invoice."
+            )
+        
+        try:
+            # Pre-processing validation and security checks
+            self._check_dependencies()
+            self._validate_file_security()
+            self._log_processing_start()
+            
+            # Check user permissions
+            if not self.env.user.has_group('wb_scandoc_integration.group_po_scanner'):
+                raise AccessError("You don't have permission to process documents")
+            
+            # Get and validate ScanDoc API credentials
+            auth_key = self._get_scandoc_auth_key()
+            
+            # Process the document with enhanced error handling
+            return self._process_document_safe(auth_key)
+            
+        except (UserError, ValidationError, AccessError):
+            # Re-raise known user-facing errors
+            raise
+        except Exception as e:
+            # Log unexpected errors and show user-friendly message
+            _logger.error(
+                "Unexpected error in document processing - User: %s, File: %s, Error: %s",
+                self.env.user.name,
+                self._get_safe_filename(),
+                str(e),
+                exc_info=True
+            )
+            raise UserError(
+                "Document processing failed due to an unexpected error. "
+                "Please check the logs or contact support. Error: %s" % str(e)
+            )
+    
+    def _get_scandoc_auth_key(self):
+        """Get and validate ScanDoc authentication key"""
+        auth_key = self.env['ir.config_parameter'].sudo().get_param(
+            'wb_scandoc_integration.scandoc_auth_key')
+        if not auth_key:
+            raise UserError(
+                "ScanDoc authentication key not configured. "
+                "Please configure it in Settings > Technical > System Parameters."
+            )
+        return auth_key
+    
+    def _process_document_safe(self, auth_key):
+        """Process document with comprehensive error handling"""
+        
+        # 🚀 NEW: Check if we already have extracted data stored
+        stored_data = self._get_stored_data()
+        if stored_data:
+            _logger.info("🎯 Using stored extracted data, skipping API call")
+            return self._process_extracted_data(stored_data)
+        
+        _logger.info("🔄 No stored data found, calling ScanDoc API")
+
+        # Prepare file and metadata
+        file_content = ''
+        try:
+            file_content = base64.b64decode(self.file)
+        except Exception as e:
+            raise UserError(_("Error decoding uploaded file: %s") % str(e))
+
+        # Detect MIME type dynamically
+        mimetype, encoding = mimetypes.guess_type(self.file_name)
+        mimetype = mimetype or 'application/octet-stream'
+
+        # Optional: Validate allowed file types
+        allowed_mimetypes = [
+            'application/pdf', 'image/jpeg', 'image/png',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # .docx
+            'application/msword',  # .doc
+        ]
+        if mimetype not in allowed_mimetypes:
+            raise UserError(_(
+                "Unsupported file type: %s. Please upload PDF, DOCX, JPG or PNG files only."
+            ) % mimetype)
+
+        # Example logging
+        mimetype = (mimetypes.guess_type(self.file_name)[0]
+                    or 'application/octet-stream')
+        url = ("https://scandocapi--scandoc-api."
+               "us-central1.hosted.app/api/documents/scan")
+
+        try:
+            # Validate dependencies before making request
+            if requests is None:
+                raise UserError("Python 'requests' library not installed. Please install it.")
+                
+            # Send file to ScanDoc with timeout and retry logic
+            url = ("https://scandocapi--scandoc-api."
+                   "us-central1.hosted.app/api/documents/scan")
+            
+            timeout = 120  # 2 minutes timeout for large files
+            max_retries = 2
+            response = None  # Initialize response variable
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    _logger.info("Sending document to ScanDoc API (attempt %d/%d)", attempt + 1, max_retries + 1)
+                    
+                    response = requests.post(
+                        url, 
+                        data={
+                            'authKey': auth_key, 
+                            'doc_type': self.doc_type or 'VendorBill'
+                        }, 
+                        files=[('file', (self._get_safe_filename(), file_content, mimetype))],
+                        timeout=timeout
+                    )
+                    
+                    # Check HTTP status
+                    response.raise_for_status()
+                    break
+                    
+                except requests.exceptions.Timeout:
+                    if attempt < max_retries:
+                        _logger.warning("Request timeout, retrying... (attempt %d/%d)", attempt + 1, max_retries + 1)
+                        continue
+                    else:
+                        raise UserError("Request timeout. The document may be too large or the service is busy.")
+                        
+                except requests.exceptions.ConnectionError:
+                    if attempt < max_retries:
+                        _logger.warning("Connection error, retrying... (attempt %d/%d)", attempt + 1, max_retries + 1)
+                        continue
+                    else:
+                        raise UserError("Cannot connect to ScanDoc API. Please check your internet connection.")
+                        
+                except requests.exceptions.HTTPError as e:
+                    if response and response.status_code == 401:
+                        raise UserError("Invalid ScanDoc API key. Please check your credentials.")
+                    elif response and response.status_code == 429:
+                        raise UserError("Rate limit exceeded. Please try again later.")
+                    elif response and response.status_code >= 500:
+                        if attempt < max_retries:
+                            _logger.warning("Server error, retrying... (attempt %d/%d)", attempt + 1, max_retries + 1)
+                            continue
+                        else:
+                            raise UserError("ScanDoc API server error. Please try again later.")
+                    else:
+                        status_code = response.status_code if response else 'Unknown'
+                        raise UserError("API request failed with status %s: %s" % (status_code, str(e)))
+            
+            # Validate we have a response after retry loop
+            if response is None:
+                raise UserError("Failed to get response from ScanDoc API after all retry attempts.")
+            
+            # Parse response safely
+            try:
+                parsed_data = response.json()
+            except ValueError as e:
+                _logger.error("Invalid JSON response from ScanDoc API: %s", response.text[:500])
+                raise UserError("Invalid response from ScanDoc API. Please contact support.")
+            
+            # Validate response structure
+            if not isinstance(parsed_data, dict):
+                raise UserError("Unexpected response format from ScanDoc API")
+                
+            # Check for API errors
+            if parsed_data.get('error'):
+                error_msg = parsed_data.get('error', 'Unknown API error')
+                _logger.error("ScanDoc API error: %s", error_msg)
+                raise ValidationError("ScanDoc API error: %s" % error_msg)
+            
+            # Check credit limits with better error handling
+            user_data = parsed_data.get('user', {})
+            remaining_scans = user_data.get('remainingScans')
+            
+            if remaining_scans is None:
+                _logger.warning("No scan limit information in API response")
+            elif remaining_scans < 0:
+                raise ValidationError(
+                    "You have exceeded your ScanDoc credit limit. "
+                    "Please purchase additional credits to continue processing documents."
+                )
+            
+            # Update scan credits safely
+            try:
+                user_data = parsed_data.get('user', {})
+                remaining_scans = user_data.get('remainingScans')
+                if remaining_scans is not None:
+                    self.env["ir.config_parameter"].sudo().set_param(
+                        "wb_scandoc_integration.scandoc_credit", str(remaining_scans)
+                    )
+            except Exception as e:
+                _logger.warning("Failed to update scan credits: %s", str(e))
+                
+            # 🚀 NEW: Store the extracted data before processing
+            self._store_extracted_data(parsed_data)
+            
+            # Process the document data
+            return self._process_extracted_data(parsed_data)
+            
+        except Exception as e:
+            if requests and hasattr(requests, 'exceptions') and isinstance(e, requests.exceptions.RequestException):
+                _logger.error("ScanDoc API request failed: %s", str(e))
+                raise UserError("ScanDoc API request failed: %s" % str(e))
+            else:
+                # Re-raise other exceptions
+                raise
+    
+    def _validate_company_match(self, data):
+        """
+        Validate if the invoice is addressed to the current company.
+        Sets warning flags if there's a mismatch for user review.
+        
+        :param data: Extracted data from ScanDoc API
+        :return: True if validation passes or can be deferred to user
+        """
+        # Get company information from invoice
+        invoice_company_name = data.get('Company Name', '').strip()
+        invoice_company_address = data.get('Company Address', '').strip()
+        
+        # Get current Odoo company information
+        current_company = self.env.company
+        current_company_name = current_company.name.strip() if current_company.name else ''
+        
+        # Build current company address for comparison
+        current_company_address_parts = [
+            current_company.street or '',
+            current_company.street2 or '',
+            current_company.city or '',
+            current_company.state_id.name if current_company.state_id else '',
+            current_company.zip or '',
+            current_company.country_id.name if current_company.country_id else ''
+        ]
+        current_company_address = ', '.join([part for part in current_company_address_parts if part]).strip()
+        
+        _logger.info("🏢 Company Validation Check:")
+        _logger.info("   Invoice Company: '%s'", invoice_company_name)
+        _logger.info("   Current Company: '%s'", current_company_name)
+        _logger.info("   Invoice Address: '%s'", invoice_company_address)
+        _logger.info("   Current Address: '%s'", current_company_address)
+        
+        # Skip validation if no company information found in invoice
+        if not invoice_company_name:
+            _logger.warning("⚠️ No company name found in invoice - proceeding with caution")
+            return True
+        
+        # Check for company name match (fuzzy matching for variations)
+        def normalize_company_name(name):
+            """Normalize company name for comparison"""
+            if not name:
+                return ''
+            # Remove common company suffixes and normalize
+            import re
+            normalized = re.sub(r'\b(ltd|limited|inc|incorporated|corp|corporation|llc|pty|pvt)\b', '', name.lower())
+            normalized = re.sub(r'[^\w\s]', '', normalized)  # Remove punctuation
+            normalized = ' '.join(normalized.split())  # Normalize whitespace
+            return normalized
+        
+        normalized_invoice_company = normalize_company_name(invoice_company_name)
+        normalized_current_company = normalize_company_name(current_company_name)
+        
+        # Check for exact or fuzzy match
+        company_match = False
+        if normalized_current_company and normalized_invoice_company:
+            # Check if one company name contains the other (for variations)
+            if (normalized_current_company in normalized_invoice_company or 
+                normalized_invoice_company in normalized_current_company):
+                company_match = True
+            
+            # Check for high similarity (at least 80% match)
+            from difflib import SequenceMatcher
+            similarity = SequenceMatcher(None, normalized_current_company, normalized_invoice_company).ratio()
+            if similarity >= 0.8:
+                company_match = True
+                _logger.info("✅ Company names match with %.1f%% similarity", similarity * 100)
+        
+        if company_match:
+            _logger.info("✅ Company validation passed - invoice is for current company")
+            # Clear any previous mismatch flags
+            self.company_mismatch_detected = False
+            self.external_invoice_details = ""
+            self.confirm_external_processing = False
+            return True
+        
+        # Company mismatch detected
+        _logger.warning("🚨 COMPANY MISMATCH DETECTED!")
+        _logger.warning("   This invoice is NOT addressed to your company!")
+        
+        # Check current confirmation state FIRST
+        _logger.info("🔍 DEBUGGING - Current confirmation state: %s", self.confirm_external_processing)
+        _logger.info("🔍 DEBUGGING - Company mismatch detected flag: %s", self.company_mismatch_detected)
+        
+        # Check if user has already confirmed in this session
+        if self.confirm_external_processing:
+            _logger.warning("✅ User %s confirmed processing external invoice for '%s'", 
+                           self.env.user.name, invoice_company_name)
+            # Create audit log for external invoice processing
+            self._create_external_invoice_audit_log(invoice_company_name, current_company_name)
+            return True
+        
+        # Set warning details for user review (only if not already confirmed)
+        mismatch_details = f"""⚠️ COMPANY MISMATCH DETECTED!
+
+📄 Invoice Company: {invoice_company_name}
+🏢 Your Company: {current_company_name}
+
+📍 Invoice Address: {invoice_company_address or 'Not specified'}
+📍 Your Address: {current_company_address or 'Not specified'}
+
+🚨 This invoice appears to be for a different company!
+Please confirm if you want to process this external invoice."""
+        
+        # Set the validation fields (only if not already set)
+        if not self.company_mismatch_detected:
+            self.company_mismatch_detected = True
+            self.external_invoice_details = mismatch_details
+            # Don't reset confirmation if user already set it
+            if not hasattr(self, 'confirm_external_processing') or self.confirm_external_processing is None:
+                self.confirm_external_processing = False
+        
+        # Log security event for audit trail
+        _logger.warning("SECURITY AUDIT: User %s processing invoice for external company '%s' (Current: '%s')", 
+                       self.env.user.name, invoice_company_name, current_company_name)
+        
+        # Return False to indicate validation failed but allow user to see confirmation UI
+        _logger.warning("🔄 Company mismatch detected - showing confirmation UI to user")
+        return False
+
+    def _create_external_invoice_audit_log(self, invoice_company, current_company):
+        """
+        Create an audit log entry for external invoice processing.
+        This helps with security monitoring and compliance.
+        """
+        try:
+            # Create audit log entry
+            audit_message = (
+                f"EXTERNAL INVOICE PROCESSED: User '{self.env.user.name}' "
+                f"(ID: {self.env.user.id}) processed invoice for external company '{invoice_company}' "
+                f"while logged into '{current_company}'. "
+                f"File: {self.file_name or 'Unknown'}, "
+                f"Timestamp: {fields.Datetime.now()}"
+            )
+            
+            # Log to server logs
+            _logger.warning("AUDIT: %s", audit_message)
+            
+            # Create a mail message for audit trail (attached to current user)
+            self.env['mail.message'].sudo().create({
+                'subject': '🚨 External Invoice Processed - Security Audit',
+                'body': f"<p><strong>Security Audit Alert:</strong></p><p>{audit_message}</p>",
+                'model': 'res.users',
+                'res_id': self.env.user.id,
+                'message_type': 'notification',
+                'author_id': self.env.user.partner_id.id,
+                'needaction': False,
+            })
+            
+            # Log to system parameter for admin tracking
+            audit_key = f'wb_scandoc_integration.external_invoice_audit_{fields.Datetime.now().strftime("%Y%m%d_%H%M%S")}'
+            self.env['ir.config_parameter'].sudo().set_param(audit_key, audit_message)
+            
+        except Exception as audit_error:
+            _logger.error("Failed to create audit log: %s", str(audit_error))
+            # Don't fail the main process due to audit logging issues
+
+    def _process_extracted_data(self, parsed_data):
+        """Process the extracted data from ScanDoc API response"""
+        _logger.info("🔍 STARTING _process_extracted_data - Context: %s", dict(self.env.context))
+        
+        # 🔒 SECURITY: Validate company match BEFORE the try block
+        data = parsed_data.get('extractedData')
+        if not data:
+            raise UserError("No extracted data found in API response")
+        
+        _logger.info("🔍 Company validation check - mismatch_detected: %s, confirm_processing: %s", 
+                    self.company_mismatch_detected, self.confirm_external_processing)
+        
+        if not self._validate_company_match(data):
+            # Company mismatch detected and confirmation UI needed
+            _logger.warning("⚠️ Company mismatch detected - returning wizard for user confirmation")
+            return {
+                'type': 'ir.actions.act_window',
+                'name': 'Scan Document - Security Confirmation Required',
+                'res_model': 'resume.parser.wizard',
+                'view_mode': 'form',
+                'res_id': self.id,
+                'target': 'new',
+                'context': self.env.context,
+            }
+        
+        _logger.info("✅ Company validation passed - proceeding with invoice creation")
+        
+        try:
+            self.file_scanned = True
+
+            # Initialize dictionaries for storing model values
+            po_vals, vendor_vals = {}, {}
+            
+            # Debug logging for currency detection
+            _logger.info("=== CURRENCY DEBUG INFO ===")
+            _logger.info("Full extracted data keys: %s", list(data.keys()) if data else 'None')
+            _logger.info("Currency field: '%s'", data.get('Currency', 'NOT_FOUND'))
+            _logger.info("Total field: '%s'", data.get('Total', 'NOT_FOUND'))
+            _logger.info("TotalAmount field: '%s'", data.get('TotalAmount', 'NOT_FOUND'))
+            _logger.info("Subtotal field: '%s'", data.get('Subtotal', 'NOT_FOUND'))
+            _logger.info("Amount field: '%s'", data.get('Amount', 'NOT_FOUND'))
+            _logger.info("=== END CURRENCY DEBUG ===")
+            
+            # Detect MIME type dynamically
+            mimetype, encoding = mimetypes.guess_type(self.file_name)
+            mimetype = mimetype or 'application/octet-stream'
+            
+            vendor_vals.update({
+                'name': data.get('Vendor Name', 'Unknown Vendor'),
+                'street': data.get('Vendor Address', ''),
+                'vat': data.get('Vendor GSTIN', ''),  # GSTIN stored in vat
+                'supplier_rank': 1,
+            })
+
+            vendor = self.env['res.partner'].sudo().search([
+                '|', ('name', '=', vendor_vals['name']),
+                ('vat', '=', vendor_vals['vat'])
+            ], limit=1)
+
+            if not vendor:
+                vendor = self.env['res.partner'].sudo().create(vendor_vals)
+            else:
+                vendor.write(vendor_vals)
+
+            invoice_date_str = data.get('Invoice Date')
+            # parsed_date = datetime.strptime(invoice_date_str, "%d/%m/%Y")
+            # date_order = fields.Datetime.to_string(parsed_date)
+
+            parsed_date = self.parse_date(invoice_date_str)
+            # Convert datetime object to Odoo format
+            date_order = fields.Datetime.to_string(parsed_date)
+            
+            # Enhanced currency detection with symbol mapping
+            currency_id = self._detect_currency(data)
+            if not currency_id:
+                currency_id = self.env.company.currency_id
+            
+            po_vals.update({
+                'partner_id': vendor.id,
+                'partner_ref': data.get('Invoice Number', ''),
+                'origin': data.get('Purchase Order Reference', ''),
+                'date_order': date_order,  # Will be parsed by Odoo
+                'company_id': self.env.company.id if self.env.company else self.env.company.id,
+                'currency_id': currency_id.id if currency_id else self.env.company.currency_id.id,
+            })
+            
+            # Enhanced tax detection
+            tax_info = self._detect_and_process_taxes(data)
+            _logger.info("🏷️ Tax information for document: %s", tax_info)
+            
+            po_line_vals = []
+
+            # 4. Prepare Purchase Order Lines with Enhanced Tax Handling
+            _logger.info("📋 Processing line items: %s", data.get('Items', []))
+            
+            items = data.get('Items', [])
+            if not items:
+                _logger.warning("⚠️ No line items found in extracted data! Creating fallback line item from subtotal.")
+                # Create a fallback line item using the subtotal
+                subtotal = self._clean_price_value(data.get('Subtotal', 0))
+                if subtotal > 0:
+                    # Find or create a generic product
+                    product = self.env['product.product'].sudo().search([
+                        ('name', '=', 'Generic Service')
+                    ], limit=1)
+                    if not product:
+                        uom_id = self.env['uom.uom'].search([('name', 'ilike', 'Unit')], limit=1)
+                        product = self.env['product.product'].sudo().create({
+                            'name': 'Generic Service',
+                            'uom_id': uom_id.id,
+                            'uom_po_id': uom_id.id,
+                            'type': 'service'
+                        })
+                    
+                    po_line_vals.append((0, 0, {
+                        'product_id': product.id,
+                        'name': f"Service from {data.get('Vendor Name', 'Vendor')}",
+                        'product_qty': 1.0,
+                        'product_uom': product.uom_id.id,
+                        'price_unit': subtotal,
+                        'taxes_id': [(6, 0, tax_info.get('default_tax_ids', []))],
+                    }))
+                    _logger.info("✅ Created fallback PO line with subtotal: %s", subtotal)
+            else:
+                for item in items:
+                    _logger.info("📦 Processing item: %s", item)
+                    _logger.info("   - Description: %s", item.get('Description', ''))
+                    _logger.info("   - Quantity: %s", item.get('Quantity', 0))
+                    
+                    # Calculate the correct unit price using intelligent detection
+                    quantity, unit_price = self._calculate_line_pricing(item)
+                    
+                    _logger.info("   - Final Quantity: %s", quantity)
+                    _logger.info("   - Final Unit Price: %s", unit_price)
+                    
+                    # Search product by name or create if needed
+                    product = self.env['product.product'].sudo().search([
+                        ('name', '=', item.get('Description', ''))
+                    ], limit=1)
+                    if not product:
+                        # Find or create UOM
+                        uom_id = self.env['uom.uom'].search([
+                            ('name', '=ilike', item.get('UOM', 'Unit'))
+                        ], limit=1)
+
+                        if not uom_id:
+                            uom_id = self.env['uom.uom'].search([
+                                ('name', 'ilike', 'Unit')
+                            ], limit=1)
+
+                        # Create product
+                        product = self.env['product.product'].sudo().create({
+                            'name': item.get('Description', ''),
+                            'uom_id': uom_id.id,
+                            'uom_po_id': uom_id.id,
+                            'default_code': item.get('HSN/SAC', '')
+                        })
+
+                    po_line_vals.append((0, 0, {
+                        'product_id': product.id,
+                        'name': item.get('Description', ''),
+                        'product_qty': quantity,
+                        'product_uom': product.uom_id.id,
+                        'price_unit': unit_price,
+                        'taxes_id': [(6, 0, self._get_line_tax_ids(item, tax_info))],
+                    }))
+                    
+                    _logger.info("✅ Created PO line with: Qty=%s, Unit Price=%s, Tax IDs=%s", 
+                               quantity, 
+                               unit_price, 
+                               self._get_line_tax_ids(item, tax_info))
+
+            po_vals['order_line'] = po_line_vals
+            
+            _logger.info("📄 Final PO values before creation:")
+            _logger.info("   - Number of lines: %s", len(po_line_vals))
+            _logger.info("   - Currency: %s", po_vals.get('currency_id'))
+            _logger.info("   - Partner: %s", po_vals.get('partner_id'))
+            
+            # Calculate totals for validation
+            calculated_subtotal = 0.0
+            for i, line in enumerate(po_line_vals):
+                line_data = line[2]  # Extract the actual line data from (0, 0, line_data)
+                line_total = line_data.get('product_qty', 0) * line_data.get('price_unit', 0)
+                calculated_subtotal += line_total
+                _logger.info("   - Line %s: Qty=%s, Price=%s, Total=%s, Product=%s", 
+                           i+1, line_data.get('product_qty'), line_data.get('price_unit'), 
+                           line_total, line_data.get('name'))
+            
+            # Compare with extracted subtotal for validation
+            extracted_subtotal = self._clean_price_value(data.get('Subtotal', 0))
+            _logger.info("   - Calculated subtotal from lines: %s", calculated_subtotal)
+            _logger.info("   - Extracted subtotal from invoice: %s", extracted_subtotal)
+            
+            # If there's a significant discrepancy, log a warning
+            if extracted_subtotal > 0 and calculated_subtotal > 0:
+                difference_pct = abs(calculated_subtotal - extracted_subtotal) / extracted_subtotal * 100
+                if difference_pct > 5:  # More than 5% difference
+                    _logger.warning("⚠️ Subtotal mismatch: Calculated=%s, Extracted=%s (%.1f%% difference)", 
+                                   calculated_subtotal, extracted_subtotal, difference_pct)
+                else:
+                    _logger.info("✅ Subtotal validation passed (%.1f%% difference)", difference_pct)
+
+            # 5. Create Purchase Order - Always Create New
+            # ScanDoc integration always creates new purchase orders for each document
+            _logger.info("🏗️ Creating NEW purchase order from ScanDoc document")
+            
+            # Only try to update if active_id refers to a purchase order, not the wizard
+            if active_po_id and active_model == 'purchase.order':
+                _logger.info("🔄 Updating EXISTING purchase order (active_id: %s)", active_po_id)
+                purchase_order = self.env['purchase.order'].sudo().search([
+                    ('id', '=', active_po_id)
+                ], limit=1)
+                
+                if purchase_order:
+                    purchase_order.write(po_vals)
+                    _logger.info("✅ Purchase order %s updated successfully", purchase_order.id)
+
+                    # Attach the uploaded resume file
+                    self.env['ir.attachment'].sudo().create({
+                        'name': self.file_name,
+                        'res_model': 'purchase.order',
+                        'res_id': purchase_order.id,
+                        'type': 'binary',
+                        'datas': self.file,
+                        'mimetype': mimetype,
+                    })
+                    
+                    # 🧹 Clear stored data after successful update
+                    self._clear_extracted_data()
+                    
+                    # � FIX: Return action to open the updated purchase order
+                    return {
+                        'type': 'ir.actions.act_window',
+                        'res_model': 'purchase.order',
+                        'res_id': purchase_order.id,
+                        'view_mode': 'form',
+                        'target': 'current',
+                    }
+                else:
+                    _logger.warning("⚠️ Purchase order ID %s not found, creating new one instead", active_po_id)
+            else:
+                _logger.info("🔍 CONTEXT DECISION - Condition false, creating new PO (active_id: %s, active_model: '%s')", 
+                           active_po_id, active_model)
+            
+            # Create new purchase order (default behavior)
+            _logger.info("🏗️ Creating NEW purchase order (no valid PO in context)")
+            purchase_order = self.env['purchase.order'].sudo().create(po_vals)
+            _logger.info("✅ Purchase order created successfully with ID: %s", purchase_order.id)
+
+            # Attach the uploaded resume file
+            attachment = self.env['ir.attachment'].sudo().create({
+                'name': self.file_name,
+                'res_model': 'purchase.order',
+                'res_id': purchase_order.id,
+                'type': 'binary',
+                'datas': self.file,
+                'mimetype': mimetype,
+            })
+            _logger.info("📎 File attachment created with ID: %s", attachment.id)
+            
+            # 🧹 Clear stored data after successful creation
+            self._clear_extracted_data()
+            
+            _logger.info("� Returning action to open purchase order %s", purchase_order.id)
+            return {
+                'type': 'ir.actions.act_window',
+                'res_model': 'purchase.order',
+                'res_id': purchase_order.id,
+                'view_mode': 'form',
+                'target': 'current',
+            }
+        
+        except Exception as e:
+            _logger.error("Failed to process extracted data: %s", str(e))
+            raise UserError("Failed to process extracted data: %s" % str(e))
+
+    def _get_tax_ids(self, tax_rate):
+        """Finds tax records by percentage."""
+        taxes = self.env['account.tax'].sudo().search([
+            ('amount', '=', float(tax_rate)),
+            ('type_tax_use', '=', 'purchase')
+        ])
+        return taxes.ids
+
+    def _detect_and_process_taxes(self, data):
+        """
+        Enhanced tax detection that handles both line-level and invoice-level taxes.
+        
+        :param data: Extracted data from ScanDoc API
+        :return: Dictionary with tax information
+        """
+        tax_info = {
+            'has_line_level_tax': False,
+            'has_invoice_level_tax': False,
+            'invoice_tax_rate': 0,
+            'invoice_tax_amount': 0,
+            'default_tax_ids': [],
+            'tax_breakdown': {}
+        }
+        
+        # Check for invoice-level tax information
+        invoice_tax_fields = [
+            'Tax', 'Tax Amount', 'Tax (GSTIN)', 'GSTIN', 'GST', 'VAT', 
+            'Total Tax', 'Tax Rate', 'Tax Percentage'
+        ]
+        
+        for field in invoice_tax_fields:
+            if data.get(field):
+                tax_value = data.get(field)
+                _logger.info("🏷️ Found invoice-level tax field '%s': %s", field, tax_value)
+                
+                # Extract tax amount and rate
+                tax_amount = self._extract_tax_amount(tax_value)
+                tax_rate = self._extract_tax_rate(tax_value, data)
+                
+                if tax_amount > 0 or tax_rate > 0:
+                    tax_info['has_invoice_level_tax'] = True
+                    tax_info['invoice_tax_amount'] = tax_amount
+                    tax_info['invoice_tax_rate'] = tax_rate
+                    break
+        
+        # Check for line-level taxes in items
+        items = data.get('Items', [])
+        for item in items:
+            line_tax_fields = ['Tax Rate (%)', 'Tax %', 'Tax Rate', 'GST %', 'VAT %']
+            for field in line_tax_fields:
+                if item.get(field):
+                    tax_info['has_line_level_tax'] = True
+                    break
+            if tax_info['has_line_level_tax']:
+                break
+        
+        # If we have invoice-level tax but no line-level tax, create default tax
+        if tax_info['has_invoice_level_tax'] and not tax_info['has_line_level_tax']:
+            if tax_info['invoice_tax_rate'] > 0:
+                tax_info['default_tax_ids'] = self._get_or_create_tax(tax_info['invoice_tax_rate'])
+        
+        _logger.info("🏷️ Tax detection result: %s", tax_info)
+        return tax_info
+
+    def _extract_tax_amount(self, tax_value):
+        """Extract numeric tax amount from tax field value."""
+        if not tax_value:
+            return 0
+        
+        # Convert to string and clean
+        tax_str = str(tax_value).strip()
+        
+        # Remove currency symbols and extract numbers
+        import re
+        numbers = re.findall(r'[\d,]+\.?\d*', tax_str)
+        
+        if numbers:
+            try:
+                # Take the largest number (likely the tax amount)
+                amounts = [float(num.replace(',', '')) for num in numbers]
+                return max(amounts)
+            except ValueError:
+                pass
+        
+        return 0
+
+    def _extract_tax_rate(self, tax_value, data):
+        """Extract tax rate percentage from tax field or calculate from amounts."""
+        if not tax_value:
+            return 0
+        
+        tax_str = str(tax_value).strip().lower()
+        
+        # Look for percentage symbol
+        if '%' in tax_str:
+            import re
+            percentages = re.findall(r'(\d+(?:\.\d+)?)%', tax_str)
+            if percentages:
+                try:
+                    return float(percentages[0])
+                except ValueError:
+                    pass
+        
+        # Try to calculate tax rate from amounts
+        tax_amount = self._extract_tax_amount(tax_value)
+        if tax_amount > 0:
+            subtotal = self._clean_price_value(data.get('Subtotal', 0))
+            if subtotal > 0:
+                calculated_rate = (tax_amount / subtotal) * 100
+                # Round to common tax rates
+                common_rates = [5, 12, 18, 28, 10, 15, 20, 25]
+                for rate in common_rates:
+                    if abs(calculated_rate - rate) < 1:  # Within 1% tolerance
+                        return rate
+                return round(calculated_rate, 2)
+        
+        return 0
+
+    def _get_or_create_tax(self, tax_rate):
+        """Get existing tax or create new one with the given rate."""
+        if not tax_rate or tax_rate <= 0:
+            return []
+        
+        # Search for existing tax
+        taxes = self.env['account.tax'].sudo().search([
+            ('amount', '=', float(tax_rate)),
+            ('type_tax_use', '=', 'purchase'),
+            ('company_id', '=', self.env.company.id)
+        ], limit=1)  # Limit to 1 to avoid duplicates
+        
+        if taxes:
+            _logger.info("✅ Found existing tax: %s%% (ID: %s)", tax_rate, taxes[0].id)
+            return [taxes[0].id]  # Return only the first tax ID as a list
+        
+        # Create new tax if not found
+        try:
+            new_tax = self.env['account.tax'].sudo().create({
+                'name': f'Purchase Tax {tax_rate}%',
+                'amount': float(tax_rate),
+                'type_tax_use': 'purchase',
+                'company_id': self.env.company.id,
+                'tax_scope': 'consu',  # Consumption
+            })
+            _logger.info("✅ Created new tax: %s%% (ID: %s)", tax_rate, new_tax.id)
+            return [new_tax.id]
+        except Exception as e:
+            _logger.error("❌ Failed to create tax %s%%: %s", tax_rate, str(e))
+            return []
+
+    def _get_line_tax_ids(self, item, tax_info):
+        """Get tax IDs for a specific line item."""
+        # First, check if the item has its own tax rate
+        line_tax_fields = ['Tax Rate (%)', 'Tax %', 'Tax Rate', 'GST %', 'VAT %']
+        for field in line_tax_fields:
+            tax_value = item.get(field)
+            if tax_value:
+                try:
+                    tax_rate = float(tax_value)
+                    if tax_rate > 0:
+                        return self._get_or_create_tax(tax_rate)
+                except (ValueError, TypeError):
+                    continue
+        
+        # If no line-level tax, use invoice-level tax
+        if tax_info['has_invoice_level_tax'] and tax_info['default_tax_ids']:
+            return tax_info['default_tax_ids']
+        
+        # Default: no tax
+        return []
+

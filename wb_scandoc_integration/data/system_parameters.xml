@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <!-- System Parameters for Production Configuration -->
+        
+        <!-- ScanDoc API Configuration -->
+        <record id="scandoc_api_url" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.scandoc_api_url</field>
+            <field name="value">https://scandocapi--scandoc-api.us-central1.hosted.app/api/documents/scan</field>
+        </record>
+        
+        <record id="scandoc_api_timeout" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.scandoc_api_timeout</field>
+            <field name="value">120</field>
+        </record>
+        
+        <record id="scandoc_max_retries" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.scandoc_max_retries</field>
+            <field name="value">2</field>
+        </record>
+        
+        <!-- File Processing Configuration -->
+        <record id="max_file_size_mb" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.max_file_size_mb</field>
+            <field name="value">50</field>
+        </record>
+        
+        <record id="allowed_file_extensions" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.allowed_file_extensions</field>
+            <field name="value">.pdf,.png,.jpg,.jpeg,.tiff,.bmp,.docx,.xlsx</field>
+        </record>
+        
+        <record id="enable_file_validation" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.enable_file_validation</field>
+            <field name="value">True</field>
+        </record>
+        
+        <!-- Currency Configuration -->
+        <record id="auto_activate_currencies" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.auto_activate_currencies</field>
+            <field name="value">True</field>
+        </record>
+        
+        <record id="default_currency_position" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.default_currency_position</field>
+            <field name="value">before</field>
+        </record>
+        
+        <!-- OCR Configuration -->
+        <record id="ocr_enhancement_enabled" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.ocr_enhancement_enabled</field>
+            <field name="value">True</field>
+        </record>
+        
+        <record id="tesseract_config" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.tesseract_config</field>
+            <field name="value">--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.,!@#$%^&amp;*()_+-=[]{}|;:,.&lt;&gt;?/~` '</field>
+        </record>
+        
+        <!-- Logging Configuration -->
+        <record id="enable_debug_logging" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.enable_debug_logging</field>
+            <field name="value">False</field>
+        </record>
+        
+        <record id="log_api_requests" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.log_api_requests</field>
+            <field name="value">True</field>
+        </record>
+        
+        <!-- Performance Configuration -->
+        <record id="enable_caching" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.enable_caching</field>
+            <field name="value">True</field>
+        </record>
+        
+        <record id="cache_duration_hours" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.cache_duration_hours</field>
+            <field name="value">24</field>
+        </record>
+        
+        <!-- Batch Processing Configuration -->
+        <record id="enable_batch_processing" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.enable_batch_processing</field>
+            <field name="value">False</field>
+        </record>
+        
+        <record id="batch_size" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.batch_size</field>
+            <field name="value">10</field>
+        </record>
+        
+        <!-- Security Configuration -->
+        <record id="enable_audit_logging" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.enable_audit_logging</field>
+            <field name="value">True</field>
+        </record>
+        
+        <record id="require_admin_approval" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.require_admin_approval</field>
+            <field name="value">False</field>
+        </record>
+        
+        <!-- Error Handling Configuration -->
+        <record id="graceful_error_recovery" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.graceful_error_recovery</field>
+            <field name="value">True</field>
+        </record>
+        
+        <record id="max_processing_attempts" model="ir.config_parameter">
+            <field name="key">wb_scandoc_integration.max_processing_attempts</field>
+            <field name="value">3</field>
+        </record>
+        
+    </data>
+</odoo>

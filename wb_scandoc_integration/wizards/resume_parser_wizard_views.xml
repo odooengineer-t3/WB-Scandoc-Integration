@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<odoo>
+    <record id="view_resume_parser_wizard_form" model="ir.ui.view">
+        <field name="name">resume.parser.wizard.form</field>
+        <field name="model">resume.parser.wizard</field>
+        <field name="arch" type="xml">
+            <form string="Resume Parser">
+                <group name="main_process_group" invisible="0">
+                    <field name="doc_type_readonly" invisible="1"/>
+                    <group>
+                        <field name="doc_type" string="Select Document Type" readonly="doc_type_readonly"/>
+                        <field name="file" string="Upload File" filename="file_name"/>
+                        <field name="file_name" string="File Name" readonly="1" force_save="1"/>
+                    </group>
+                    <field name="file_scanned" invisible="1"/>
+                </group>
+                
+                <!-- Company Validation Fields - Full Width -->
+                <field name="company_mismatch_detected" invisible="1"/>
+                <div name="company_warning_section" invisible="not company_mismatch_detected" 
+                     class="alert alert-danger" style="margin: 10px; padding: 15px;">
+                    <div class="o_row">
+                        <i class="fa fa-exclamation-triangle text-danger" aria-hidden="true" style="font-size: 18px; margin-right: 8px;"/>
+                        <h4 class="text-danger font-weight-bold" style="margin: 0;">⚠️ Security Warning: Company Mismatch Detected!</h4>
+                    </div>
+                    <br/>
+                    <field name="external_invoice_details" readonly="1" 
+                           widget="text" nolabel="1" class="text-muted" style="white-space: pre-line; margin-bottom: 10px;"/>
+                    <div style="margin: 15px 0; padding: 10px; background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px;">
+                        <field name="confirm_external_processing" 
+                               string="✅ I understand and confirm processing this external invoice" 
+                               help="Check this box to confirm you are authorized to process invoices for other companies"
+                               style="margin-right: 10px;"/>
+                        <span style="font-weight: bold; color: #495057;">I understand and confirm processing this external invoice</span>
+                    </div>
+                    <div class="text-info" style="margin-top: 10px;">
+                        <i class="fa fa-info-circle" aria-hidden="true" style="margin-right: 5px;"/>
+                        <em>Please ensure you have proper authorization before confirming.</em>
+                    </div>
+                </div>
+                <footer>
+                    <button string="Process Resume" type="object" name="process_resume" class="btn-primary"
+                            invisible="doc_type!='Resume'"/>
+                    <button string="Process Challan" type="object" name="process_purchase_receipt"
+                            class="btn-primary" invisible="doc_type!='DeliveryChalaan'"/>
+                    <button string="Process PO" type="object" name="process_purchase_order" class="btn-primary"
+                            invisible="doc_type!='VendorBill'"/>
+                    <button string="Close" class="btn-secondary" special="cancel" id="close_wizard"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+    <record id="action_resume_parser_wizard" model="ir.actions.act_window">
+        <field name="name">Resume Parser</field>
+        <field name="res_model">resume.parser.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="context">{'default_doc_type': 'Resume', 'readonly_doc_type': True}</field>
+        <field name="target">new</field>
+    </record>
+    <record id="action_scandoc_wizard" model="ir.actions.act_window">
+        <field name="name">Quick Scan</field>
+        <field name="res_model">resume.parser.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+    </record>
+</odoo>

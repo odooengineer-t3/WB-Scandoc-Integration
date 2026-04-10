@@ -1,0 +1,323 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+    <t t-name="wb_scandoc_dashboard.SentimentDashboard" owl="1">
+        <div class="o_static_dashboard_container p-4 o-dashboard-scroll">
+
+            <!-- ====== ANALYZING SPINNER ====== -->
+            <!-- <t t-if="state.analysis_status !== 'done'">
+                <div class="text-center p-5 mt-5">
+                    <i class="fa fa-spinner fa-spin fa-3x text-muted"></i>
+                    <h4 class="mt-3 text-muted">Analyzing Resume...</h4>
+                    <p class="text-muted">This may take 10–30 seconds.</p>
+                </div>
+            </t> -->
+
+            <!-- ====== FULL DASHBOARD ====== -->
+            <!-- <t t-else=""> -->
+<h1 class="text-center">Resume Analysis Complete</h1>
+<h5 class="text-center text-muted">Comprehensive sentiment and behavioral analysis</h5>
+
+<div class="row mt-5 g-4 align-items-stretch resume-analysis-cards">
+    <!-- LEFT CARD -->
+    <div class="col-lg-6 h-100">
+        <div class="card h-100 border-0 shadow-sm">
+            <div class="card-body d-flex flex-column">
+                <h3 class="card-title text-info mb-4">
+                    Sentiment &amp; Behavioral Intelligence
+                </h3>
+
+                <div class="position-relative d-inline-block mx-auto mb-4">
+                    <svg class="circular-chart" width="160" height="160" viewBox="0 0 160 160">
+                        <circle class="bg-circle" cx="80" cy="80" r="70" fill="none" stroke="#e9ecef" stroke-width="12"/>
+                        <circle class="progress-circle" cx="80" cy="80" r="70" fill="none" stroke="#28a745" stroke-width="12"
+                                stroke-linecap="round"
+                                t-attf-stroke-dasharray="{{ 2 * 3.1416 * 70 }}, {{ 2 * 3.1416 * 70 }}"
+                                t-attf-stroke-dashoffset="{{ (1 - state.sentiment_score/100) * 2 * 3.1416 * 70 }}"/>
+                    </svg>
+                    <div class="position-absolute top-50 start-50 translate-middle text-center w-100">
+                        <div class="fs-3 fw-bold text-success" t-esc="state.sentiment_score"/>
+                        <div class="small text-muted">Sentiment Score</div>
+                    </div>
+                </div>
+
+                <div class="row g-2 small mb-3 flex-grow-1">
+                    <div class="col-6"><strong>Emotional Tone:</strong></div>
+                    <div class="col-6" t-esc="state.emotional_tone"/>
+
+                    <div class="col-6"><strong>Communication Style:</strong></div>
+                    <div class="col-6">
+                        <span class="badge bg-info text-dark" t-esc="state.communication_style"/>
+                    </div>
+
+                    <div class="col-6"><strong>Cultural Fit:</strong></div>
+                    <div class="col-6">
+                        <t t-esc="state.cultural_alignment"/> <t t-esc="state.cultural_fit_score"/>
+                    </div>
+
+                    <div class="col-6"><strong>Risk:</strong></div>
+                    <div class="col-6">
+                        <span t-attf-class="badge {{ state.risk_assessment == 'Low Risk' ? 'bg-success' : 'bg-warning' }}">
+                            <t t-esc="state.risk_assessment"/>
+                        </span>
+                    </div>
+
+                    <div class="col-6"><strong>Hire Recommendation:</strong></div>
+                    <div class="col-6"><strong t-esc="state.hire_recommendation_score"/></div>
+                </div>
+
+                <p class="text-muted small mb-3">
+                    The language demonstrates enthusiasm for growth and collaboration.
+                </p>
+
+                <!-- FIXED: Added t-key -->
+                <div class="mt-auto">
+                    <h6 class="mb-2">Key Personality Traits</h6>
+                    <div class="d-flex flex-wrap gap-1">
+                        <t t-if="state.personality_traits and state.personality_traits != '—'">
+                            <t t-foreach="state.personality_traits.split(', ')" t-as="trait" t-key="trait_index">
+                                <span class="badge bg-secondary" t-esc="trait.trim()"/>
+                            </t>
+                        </t>
+                        <t t-else="">
+                            <span class="text-muted small">No Data Found</span>
+                        </t>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- RIGHT CARD -->
+    <div class="col-lg-6" style="height:510px;">
+        <div class="card h-100 border-0 shadow-sm">
+            <div class="card-body d-flex flex-column">
+                <h3 class="card-title text-success mb-4">
+                    Confidence Level Analysis
+                </h3>
+
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <strong>Overall Confidence:</strong>
+                    <span class="badge bg-warning text-dark" t-esc="state.confidence_score"/>
+                </div>
+
+                <!-- FIXED: Added t-key -->
+               <h6 class="text-muted mb-2">Confidence Indicators</h6>
+                <ul class="list-unstyled small mb-3">
+                    <t t-if="state.confidence_indicators and state.confidence_indicators != '—'">
+                        <t t-foreach="state.confidence_indicators.split(',')" t-as="indicator" t-key="indicator">
+                            <t t-if="indicator.trim()">
+                                <li class="text-success">
+                                    <i class="fa fa-check me-1"></i>
+                                    <t t-esc="indicator.trim()"/>
+                                </li>
+                            </t>
+                        </t>
+                    </t>
+                    <t t-else="">
+                        <li class="text-muted"><i class="fa fa-minus me-1"></i>No Data Found</li>
+                    </t>
+                </ul>
+
+                <!-- FIXED: Added t-key -->
+                <h6 class="text-muted mb-2">Areas for Improvement</h6>
+                <ul class="list-unstyled small">
+                    <t t-if="state.areas_for_improvement and state.areas_for_improvement != '—'">
+                        <t t-foreach="state.areas_for_improvement.split('\n')" t-as="improvement" t-key="improvement_index">
+                            <li class="text-warning"><i class="fa fa-exclamation-triangle me-1"></i> <t t-esc="improvement.trim()"/></li>
+                        </t>
+                    </t>
+                    <t t-else="">
+                        <li class="text-muted"><i class="fa fa-minus me-1"></i>No Data Found</li>
+                    </t>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+                <!-- SECOND ROW -->
+   <!--              <div class="row mt-4">
+                    <div class="col-lg-6 mb-4">
+                        <div class="card p-3 shadow-sm h-100 equal-height-card">
+                            <div class="card-body d-flex flex-column">
+                                <h4 class="card-title text-primary mb-3">Communication Style Profiling</h4>
+                                <h6>Primary Style:
+                                    <span class="badge"
+                                          t-attf-style="background-color: {{ state.communication_style_color }}!important; color: white;">
+                                        <t t-esc="state.communication_style"/>
+                                    </span>
+                                </h6>
+                                <h6 class="mt-3 text-muted">Areas for Development</h6>
+                                <ul class="list-unstyled mt-auto">
+                                    <t t-if="state.areas_for_development and state.areas_for_development !== '—'">
+                                        <t t-foreach="state.areas_for_development.split(', ')" t-as="d" t-key="d_index">
+                                            <li><i class="fa fa-exclamation-triangle text-warning mr-2"></i><t t-esc="d.trim()"/></li>
+                                        </t>
+                                    </t>
+                                    <t t-else="">
+                                        <li><i class="fa fa-check text-success mr-2"></i>No major gaps</li>
+                                    </t>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-lg-6 mb-4 h-100">
+                        <div class="card p-3 shadow-sm h-100 equal-height-card">
+                            <div class="card-body d-flex flex-column">
+                                <h4 class="card-title text-success mb-3">Cultural Fit Indicators</h4>
+                                <p><strong>Cultural Alignment:</strong>
+                                    <span><t t-esc="state.cultural_alignment"/></span>
+                                    (<span t-esc="state.cultural_fit_score"/>) 
+                                </p>
+                                <h6 class="mt-3 text-muted">Collaboration Indicators</h6>
+                                <ul class="list-unstyled mt-auto">
+                                    <t t-if="state.collaboration_indicators and state.collaboration_indicators !== '—'">
+                                        <t t-foreach="state.collaboration_indicators.split(', ')" t-as="c" t-key="c_index">
+                                            <li><i class="fa fa-users text-success mr-2"></i><t t-esc="c"/></li>
+                                        </t>
+                                    </t>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                </div> -->
+
+               <!-- THIRD ROW -->
+                <div class="row mt-4">
+                    <!-- Communication Style Profiling -->
+                    <div class="col-lg-6 mb-4">
+                        <div class="card h-100 shadow-sm border-0">
+                            <div class="card-body">
+                                <h4 class="card-title text-primary mb-3">Communication Style Profiling</h4>
+                                <p><strong>Primary Style:</strong>
+                                    <span class="badge bg-primary text-light">
+                                        <t t-esc="state.communication_style"/>
+                                    </span>
+                                </p>
+                                <h6 class="text-muted mt-3">Areas for Development</h6>
+                                <ul class="list-unstyled">
+                                    <t t-if="state.areas_for_development and state.areas_for_development !== '—'">
+                                        <t t-foreach="state.areas_for_development.split(', ')" t-as="dev" t-key="dev_index">
+                                            <li><i class="fa fa-exclamation-triangle text-warning me-2"></i><t t-esc="dev"/></li>
+                                        </t>
+                                    </t>
+                                    <t t-else="">
+                                        <li><i class="fa fa-check text-success me-2"></i>No significant gaps</li>
+                                    </t>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Cultural Fit Indicators -->
+                    <div class="col-lg-6 mb-4">
+                        <div class="card h-100 shadow-sm border-0">
+                            <div class="card-body">
+                                <h4 class="card-title text-success mb-3">Cultural Fit Indicators</h4>
+                                <p><strong>Cultural Alignment:</strong>
+                                    <span class="text-success"><t t-esc="state.cultural_alignment"/></span>
+                                    (<t t-esc="state.cultural_fit_score"/>)
+                                </p>
+                                <h6 class="text-muted mt-3">Collaboration Indicators</h6>
+                                <ul class="list-unstyled">
+                                    <t t-if="state.collaboration_indicators and state.collaboration_indicators !== '—'">
+                                        <t t-foreach="state.collaboration_indicators.split(', ')" t-as="ci" t-key="ci_index">
+                                            <li><i class="fa fa-users text-success me-2"></i><t t-esc="ci"/></li>
+                                        </t>
+                                    </t>
+                                    <t t-else="">
+                                        <li class="text-muted">No Data Found</li>
+                                    </t>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- SECOND LINE of THIRD ROW -->
+                <div class="row">
+                    <!-- Motivation Analysis -->
+                    <div class="col-lg-6 mb-4">
+                        <div class="card h-100 shadow-sm border-0">
+                            <div class="card-body">
+                                <h4 class="card-title text-warning mb-3">Motivation Analysis</h4>
+                                <p><strong>Drive:</strong>
+                                    <span t-attf-style="color: {{ state.drive_color || '#28a745' }}">
+                                        <t t-esc="state.drive_level"/>
+                                    </span>
+                                    (<t t-esc="state.motivation_score"/>)
+                                </p>
+                                <!-- <h6 class="text-muted mt-3">Primary Motivators</h6>
+                                <p>
+                                    <t t-if="state.primary_motivators and state.primary_motivators !== '—'">
+                                        <t t-esc="state.primary_motivators"/>
+                                    </t>
+                                    <t t-else="">—</t>
+                                </p> -->
+                                  <div class="mt-auto">
+                                <h6 class="mb-2">Primary Motivators</h6>
+                                <div class="d-flex flex-wrap gap-1">
+                                    <t t-if="state.primary_motivators and state.primary_motivators !== '—'">
+                                        <t t-foreach="state.primary_motivators.split(', ')" t-as="trait" t-key="trait_index">
+                                            <span class="badge bg-secondary" t-esc="trait.trim()"/>
+                                        </t>
+                                    </t>
+                                    <t t-else="">
+                                        <span class="text-muted small">No Data Found</span>
+                                    </t>
+                                </div>
+                            </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Red Flag Detection -->
+                    <div class="col-lg-6 mb-4">
+                        <div class="card h-100 shadow-sm border-0">
+                            <div class="card-body">
+                                <h4 class="card-title text-danger mb-3">Red Flag Detection</h4>
+                                <p><strong>Risk:</strong>
+                                    <span><t t-esc="state.risk_assessment"/></span>
+                                </p>
+
+                                <!-- Dynamic Red Flags -->
+                                <t t-if="state.red_flags_detected and state.red_flags_detected.trim() !== '' and state.red_flags_detected !== '—'">
+                                    <t t-foreach="state.red_flags_detected.split(',')" t-as="flag" t-key="flag_index">
+                                        <div class="alert alert-warning p-2 mb-2 d-flex align-items-center">
+                                            <i class="fa fa-exclamation-triangle text-dark me-2"></i>
+                                            <span><t t-esc="flag.trim()"/></span>
+                                        </div>
+                                    </t>
+                                </t>
+                                <t t-else="">
+                                    <div class="alert alert-success p-2 d-flex align-items-center">
+                                        <i class="fa fa-check text-success me-2"></i>
+                                        <strong>No Red Flags Detected:</strong> Resume shows no major warning signs.
+                                    </div>
+                                </t>
+
+                                <h6 class="text-muted mt-3">Positive Indicators</h6>
+                                <ul class="list-unstyled">
+                                    <t t-if="state.positive_indicators and state.positive_indicators !== '—'">
+                                        <t t-foreach="state.positive_indicators.split(',')" t-as="pi" t-key="pi_index">
+                                            <li><i class="fa fa-thumbs-up text-success me-2"></i><t t-esc="pi"/></li>
+                                        </t>
+                                    </t>
+                                    <t t-else=""><li class="text-muted">No Data Found</li></t>
+                                </ul>
+
+                                <h6 class="text-muted mt-3">Verification Needed</h6>
+                                <ul class="list-unstyled mb-0">
+                                    <li>Confirm project outcomes and metrics</li>
+                                    <li>Validate leadership experience claims</li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            <!-- </t> -->
+            <!-- END t-else -->
+        </div>
+    </t>
+</templates>
